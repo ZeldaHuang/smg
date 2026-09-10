@@ -21,6 +21,7 @@ use crate::{
     proxy::{call_worker, ProxyRequest},
     selector::Selector,
     state::RlState,
+    table::RlTable,
     view::{RlWorkerInfo, RlWorkerView},
 };
 
@@ -30,11 +31,15 @@ pub(crate) struct FanoutQuery {
 }
 
 /// DP-collapsed workers matching `selector`, sorted by base URL.
-pub fn resolve_targets(view: &dyn RlWorkerView, selector: &Selector) -> Vec<RlWorkerInfo> {
+pub fn resolve_targets(
+    view: &dyn RlWorkerView,
+    table: &RlTable,
+    selector: &Selector,
+) -> Vec<RlWorkerInfo> {
     collapse(view.list())
         .into_iter()
         .map(|(w, _)| w)
-        .filter(|w| selector.matches(&merged_labels(w)))
+        .filter(|w| selector.matches(&merged_labels(table, w)))
         .collect()
 }
 
@@ -128,7 +133,7 @@ pub(crate) async fn fanout_handler(
             Ok(r) => r,
             Err(e) => return e.into_response(),
         };
-    let targets = resolve_targets(state.view.as_ref(), &selector);
+    let targets = resolve_targets(state.view.as_ref(), &state.table, &selector);
     if targets.is_empty() {
         record_fanout("no_match", started.elapsed());
         return RlError::NoWorkersMatch(selector.source().to_string()).into_response();

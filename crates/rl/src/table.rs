@@ -8,6 +8,7 @@ use std::sync::{
 };
 
 use dashmap::DashMap;
+use openai_protocol::rl::{RlControlState, RlVersionSource};
 
 use crate::{metrics, policy::VersionPolicy, version::Version};
 
@@ -52,6 +53,36 @@ impl VersionSource {
             Self::Registration => "registration",
             Self::Passthrough => "passthrough",
             Self::Api => "api",
+        }
+    }
+}
+
+impl From<ControlState> for RlControlState {
+    fn from(c: ControlState) -> Self {
+        match c {
+            ControlState::Active => Self::Active,
+            ControlState::Paused => Self::Paused,
+            ControlState::Asleep => Self::Asleep,
+        }
+    }
+}
+
+impl From<RlControlState> for ControlState {
+    fn from(c: RlControlState) -> Self {
+        match c {
+            RlControlState::Active => Self::Active,
+            RlControlState::Paused => Self::Paused,
+            RlControlState::Asleep => Self::Asleep,
+        }
+    }
+}
+
+impl From<VersionSource> for RlVersionSource {
+    fn from(s: VersionSource) -> Self {
+        match s {
+            VersionSource::Registration => Self::Registration,
+            VersionSource::Passthrough => Self::Passthrough,
+            VersionSource::Api => Self::Api,
         }
     }
 }

@@ -26,6 +26,8 @@ WORKER = {
     "role": None,
     "health": "ready",
     "weight_version": "7",
+    "version_source": "api",
+    "control": "active",
     "labels": {"tp_size": "1"},
     "capabilities": {
         "source": "static",
