@@ -938,6 +938,26 @@ impl PolicyRegistry {
         }
     }
 
+    /// The worker's engine flushed its cache (a weight refit): reset its
+    /// entries in every cache-aware policy that could route the model.
+    ///
+    /// A model can route through its explicit, default, or PD/EPD leg policy;
+    /// `policies_for_model` covers all of them and deduplicates shared
+    /// instances, so each tree is reset at most once. The worker keeps its
+    /// load state — it is still serving, just with a cold cache.
+    pub fn reset_worker_cache(&self, worker: &dyn Worker) {
+        for policy in self.policies_for_model(worker.model_id()) {
+            if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                cache_aware.reset_worker_cache(worker);
+                debug!(
+                    worker = worker.url(),
+                    policy = policy.name(),
+                    "Reset cache-aware entries after a weight version change"
+                );
+            }
+        }
+    }
+
     /// Drop a removed worker's cached load report from all load-aware
     /// policies.
     ///
@@ -1135,6 +1155,70 @@ mod tests {
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
         }
+    }
+
+    /// Downcast a registry policy to the cache-aware implementation under test.
+    fn as_cache_aware(policy: &Arc<dyn LoadBalancingPolicy>) -> &CacheAwarePolicy {
+        policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap()
+    }
+
+    #[test]
+    fn reset_worker_cache_clears_the_model_and_leg_policies() {
+        let reg = PolicyRegistry::new(cache_aware_config());
+        let leg = cache_aware_policy();
+        reg.set_prefill_policy(Arc::clone(&leg));
+        let workers = vec![worker("http://w1:8000", WorkerType::Regular)];
+        let model = workers[0].model_id().to_string();
+        reg.on_worker_added(&model, None);
+        reg.init_cache_aware_policy(&model, &workers);
+        let model_policy = reg.get_policy(&model).unwrap();
+
+        let text = "a long shared instruction block this worker has served before";
+        for policy in [&model_policy, &leg] {
+            as_cache_aware(policy).insert_text_for_test(&model, text, workers[0].url());
+            assert_eq!(
+                as_cache_aware(policy).string_prefix_for_tenant(&model, text, workers[0].url()),
+                text
+            );
+        }
+
+        reg.reset_worker_cache(workers[0].as_ref());
+
+        for policy in [&model_policy, &leg] {
+            assert_eq!(
+                as_cache_aware(policy).string_prefix_for_tenant(&model, text, workers[0].url()),
+                "",
+                "every cache-aware policy that may route the model must forget the flush"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_worker_cache_reaches_a_model_served_by_the_default_policy() {
+        // A model with no explicit entry routes through the default policy, so
+        // reaching only `model_policies` would leave a flushed worker's tree
+        // stale (the bug `policies_for_model` exists to prevent).
+        let reg = PolicyRegistry::new(cache_aware_config());
+        let workers = [worker("http://w1:8000", WorkerType::Regular)];
+        let model = workers[0].model_id().to_string();
+        let default_policy = reg.get_default_policy();
+        assert!(
+            reg.get_policy(&model).is_none(),
+            "precondition: no per-model policy"
+        );
+        let text = "default-policy deployment prefix";
+        as_cache_aware(&default_policy).insert_text_for_test(&model, text, workers[0].url());
+
+        reg.reset_worker_cache(workers[0].as_ref());
+
+        assert_eq!(
+            as_cache_aware(&default_policy).string_prefix_for_tenant(
+                &model,
+                text,
+                workers[0].url()
+            ),
+            ""
+        );
     }
 
     fn headers_with_tokens(value: &str) -> HeaderMap {
