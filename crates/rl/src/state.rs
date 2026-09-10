@@ -9,6 +9,7 @@ use tracing::info;
 use crate::{
     config::RlConfig,
     metrics,
+    observe::Observation,
     policy::VersionPolicy,
     table::{ControlState, NoopEvictionSink, RlTable, VersionEvictionSink, VersionSource},
     version::Version,
@@ -84,6 +85,23 @@ impl RlState {
             );
         }
         changed
+    }
+
+    /// Apply what a successful proxied call revealed about `worker`'s engine.
+    pub fn apply_observation(
+        &self,
+        worker: &RlWorkerInfo,
+        observation: Observation,
+        source: VersionSource,
+    ) {
+        match observation {
+            Observation::Version(version) => {
+                self.apply_version(worker, version, source);
+            }
+            Observation::Control(control) => {
+                self.apply_control(worker, control);
+            }
+        }
     }
 
     /// Record a control state for `worker`'s engine.

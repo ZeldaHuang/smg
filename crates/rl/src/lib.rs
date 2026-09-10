@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod error;
 pub mod fanout;
 pub mod metrics;
+pub mod observe;
 pub mod path;
 pub mod policy;
 pub mod proxy;

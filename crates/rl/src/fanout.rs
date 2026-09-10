@@ -231,6 +231,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fanned_out_refit_records_the_version_on_every_target() {
+        let e1 = FakeEngine::start(StatusCode::OK, json!({}), 0).await;
+        let e2 = FakeEngine::start(StatusCode::OK, json!({}), 0).await;
+        let state = state(
+            vec![
+                worker("w1", &e1.url, RuntimeType::Sglang),
+                worker("w2", &e2.url, RuntimeType::Sglang),
+            ],
+            8,
+        );
+        let app = crate::router::<()>(Arc::clone(&state));
+        let req = Request::post("/engine/update_weight_version?selector=engine%3Dsglang")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"new_version": "9"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.table().version_of(&e1.url).unwrap().as_str(), "9");
+        assert_eq!(state.table().version_of(&e2.url).unwrap().as_str(), "9");
+    }
+
+    #[tokio::test]
     async fn one_failure_is_207_and_names_the_worker() {
         let good = FakeEngine::start(StatusCode::OK, json!({}), 0).await;
         let bad = FakeEngine::start(StatusCode::INTERNAL_SERVER_ERROR, json!({"e": 1}), 0).await;
