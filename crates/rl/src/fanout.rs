@@ -27,7 +27,15 @@ use crate::{
 
 #[derive(Deserialize)]
 pub(crate) struct FanoutQuery {
-    selector: Option<String>,
+    pub(crate) selector: Option<String>,
+}
+
+/// The `selector` query parameter, required and non-empty.
+pub(crate) fn parse_selector(selector: Option<String>) -> Result<Selector, RlError> {
+    match selector.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => Selector::parse(s),
+        _ => Err(RlError::SelectorRequired),
+    }
 }
 
 /// DP-collapsed workers matching `selector`, sorted by base URL.
@@ -121,12 +129,9 @@ pub(crate) async fn fanout_handler(
     body: Bytes,
 ) -> Response {
     let started = Instant::now();
-    let selector = match selector.as_deref().map(str::trim) {
-        Some(s) if !s.is_empty() => match Selector::parse(s) {
-            Ok(sel) => sel,
-            Err(e) => return e.into_response(),
-        },
-        _ => return RlError::SelectorRequired.into_response(),
+    let selector = match parse_selector(selector) {
+        Ok(sel) => sel,
+        Err(e) => return e.into_response(),
     };
     let req =
         match ProxyRequest::from_parts(method, &raw_path, raw_query.as_deref(), &headers, body) {
