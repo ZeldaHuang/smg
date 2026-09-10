@@ -844,8 +844,10 @@ impl ConfigValidator {
             .map_err(|reason| ConfigError::InvalidValue {
                 field: "rl".to_string(),
                 value: format!(
-                    "control_timeout_secs={} fanout_concurrency={}",
-                    config.rl.control_timeout_secs, config.rl.fanout_concurrency
+                    "control_timeout_secs={} fanout_concurrency={} version_policy={}",
+                    config.rl.control_timeout_secs,
+                    config.rl.fanout_concurrency,
+                    config.rl.version_policy
                 ),
                 reason,
             })
@@ -2307,5 +2309,15 @@ mod tests {
             })
             .build_unchecked();
         assert!(ConfigValidator::validate(&ok).is_ok());
+    }
+
+    #[test]
+    fn rl_version_policy_requires_the_flag() {
+        let mut config = RouterConfig::default();
+        config.rl.version_policy = smg_rl::VersionPolicy::LatestOnly;
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("version_policy"), "{err}");
+        config.rl.enabled = true;
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 }
