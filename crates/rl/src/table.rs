@@ -4,7 +4,7 @@
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex, MutexGuard, PoisonError,
 };
 
 use dashmap::DashMap;
@@ -87,12 +87,30 @@ pub fn base_url_of(worker_url: &str) -> &str {
     }
 }
 
+/// A freshly observed engine: unversioned and active until a write says
+/// otherwise.
+fn fresh(model: &str) -> EngineState {
+    EngineState {
+        model: Arc::from(model),
+        version: None,
+        version_source: None,
+        control: ControlState::Active,
+    }
+}
+
 pub struct RlTable {
     entries: DashMap<Arc<str>, EngineState>,
     fleet_max: DashMap<Arc<str>, Version>,
     /// Entries whose control state is not `Active`; lets `any` skip the map.
     inactive: AtomicUsize,
     sink: Arc<dyn VersionEvictionSink>,
+    /// Serializes every write. `recompute_fleet_max` is a scan-then-store
+    /// across two `DashMap`s with no synchronization of its own, so two
+    /// concurrent writers for the same model could otherwise leave
+    /// `fleet_max` durably stale. Writes are control-path and rare (a
+    /// refit, a pause, a registration), so one uncontended lock is the
+    /// whole cost; reads never take it.
+    writes: Mutex<()>,
 }
 
 impl RlTable {
@@ -102,12 +120,18 @@ impl RlTable {
             fleet_max: DashMap::new(),
             inactive: AtomicUsize::new(0),
             sink,
+            writes: Mutex::new(()),
         }
+    }
+
+    fn lock_writes(&self) -> MutexGuard<'_, ()> {
+        self.writes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Insert an entry from a registration label unless one exists. Returns
     /// whether an entry was inserted.
     pub fn seed(&self, base_url: &str, model: &str, label: Option<&str>) -> bool {
+        let _guard = self.lock_writes();
         if self.entries.contains_key(base_url) {
             return false;
         }
@@ -115,10 +139,9 @@ impl RlTable {
         self.entries.insert(
             Arc::from(base_url),
             EngineState {
-                model: Arc::from(model),
                 version_source: version.as_ref().map(|_| VersionSource::Registration),
                 version,
-                control: ControlState::Active,
+                ..fresh(model)
             },
         );
         self.recompute_fleet_max(model);
@@ -128,29 +151,32 @@ impl RlTable {
     /// Overwrite the version from a (changed) registration label, keeping
     /// the control state.
     pub fn reseed(&self, base_url: &str, model: &str, label: Option<&str>) {
+        let _guard = self.lock_writes();
         let version = Version::from_label(label);
-        let changed = {
-            let mut entry =
-                self.entries
-                    .entry(Arc::from(base_url))
-                    .or_insert_with(|| EngineState {
-                        model: Arc::from(model),
-                        version: None,
-                        version_source: None,
-                        control: ControlState::Active,
-                    });
+        let (changed, model) = {
+            let mut entry = self
+                .entries
+                .entry(Arc::from(base_url))
+                .or_insert_with(|| fresh(model));
             let changed = entry.version != version;
             entry.version_source = version.as_ref().map(|_| VersionSource::Registration);
             entry.version.clone_from(&version);
-            changed
+            (changed, Arc::clone(&entry.model))
         };
-        self.recompute_fleet_max(model);
+        self.recompute_fleet_max(&model);
         if changed {
-            self.after_version_change(model, base_url, version.as_ref());
+            self.after_version_change(&model, base_url, version.as_ref());
         }
     }
 
     pub fn remove(&self, base_url: &str) {
+        let _guard = self.lock_writes();
+        self.remove_locked(base_url);
+    }
+
+    /// `remove`'s body, for callers that already hold `writes` (namely
+    /// `retain`, which must not re-lock the mutex it is already holding).
+    fn remove_locked(&self, base_url: &str) {
         let Some((_, state)) = self.entries.remove(base_url) else {
             return;
         };
@@ -161,6 +187,7 @@ impl RlTable {
     /// Drop every entry whose base URL fails `keep` (resync after a lagged
     /// event stream).
     pub fn retain(&self, keep: impl Fn(&str) -> bool) {
+        let _guard = self.lock_writes();
         let dropped: Vec<Arc<str>> = self
             .entries
             .iter()
@@ -168,7 +195,7 @@ impl RlTable {
             .map(|e| Arc::clone(e.key()))
             .collect();
         for base_url in dropped {
-            self.remove(&base_url);
+            self.remove_locked(&base_url);
         }
     }
 
@@ -180,16 +207,12 @@ impl RlTable {
         version: Version,
         source: VersionSource,
     ) -> bool {
+        let _guard = self.lock_writes();
         let (changed, model) = {
-            let mut entry =
-                self.entries
-                    .entry(Arc::from(base_url))
-                    .or_insert_with(|| EngineState {
-                        model: Arc::from(model),
-                        version: None,
-                        version_source: None,
-                        control: ControlState::Active,
-                    });
+            let mut entry = self
+                .entries
+                .entry(Arc::from(base_url))
+                .or_insert_with(|| fresh(model));
             let changed = entry.version.as_ref() != Some(&version);
             entry.version = Some(version.clone());
             entry.version_source = Some(source);
@@ -204,16 +227,12 @@ impl RlTable {
 
     /// Record a control state. Returns whether it changed.
     pub fn set_control(&self, base_url: &str, model: &str, control: ControlState) -> bool {
+        let _guard = self.lock_writes();
         let changed = {
-            let mut entry =
-                self.entries
-                    .entry(Arc::from(base_url))
-                    .or_insert_with(|| EngineState {
-                        model: Arc::from(model),
-                        version: None,
-                        version_source: None,
-                        control: ControlState::Active,
-                    });
+            let mut entry = self
+                .entries
+                .entry(Arc::from(base_url))
+                .or_insert_with(|| fresh(model));
             let changed = entry.control != control;
             entry.control = control;
             changed
@@ -262,7 +281,9 @@ impl RlTable {
         self.sink.on_version_changed(model, base_url);
     }
 
-    /// Scan the model's entries; fleets are small and this runs on writes only.
+    /// Scan the model's entries; fleets are small and this runs on writes
+    /// only. Always called with `writes` held: the scan-then-store here is
+    /// not atomic on its own.
     fn recompute_fleet_max(&self, model: &str) {
         let max = self
             .entries
@@ -432,5 +453,52 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert_eq!(t.fleet_max("m").unwrap().as_str(), "1");
         assert_eq!(t.inactive_count(), 0);
+    }
+
+    #[test]
+    fn reseed_recomputes_using_the_entrys_stored_model_not_the_callers_argument() {
+        let (t, sink) = table();
+        t.seed("http://a:1", "real-model", Some("5"));
+        assert_eq!(t.fleet_max("real-model").unwrap().as_str(), "5");
+
+        // A caller passes a model that doesn't match what the entry was
+        // seeded under; the stored model must win for both the fleet-max
+        // recompute and the eviction-sink call.
+        t.reseed("http://a:1", "wrong-model", Some("9"));
+
+        assert_eq!(t.get("http://a:1").unwrap().model.as_ref(), "real-model");
+        assert_eq!(t.fleet_max("real-model").unwrap().as_str(), "9");
+        assert_eq!(t.fleet_max("wrong-model"), None);
+        assert_eq!(
+            sink.0.lock().unwrap().last(),
+            Some(&("real-model".to_string(), "http://a:1".to_string()))
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_leave_fleet_max_consistent() {
+        let (t, _) = table();
+        let t = Arc::new(t);
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let t = Arc::clone(&t);
+                std::thread::spawn(move || {
+                    let base_url = format!("http://w{i}:1");
+                    for v in 1..=200 {
+                        t.set_version(
+                            &base_url,
+                            "m",
+                            Version::parse(&v.to_string()),
+                            VersionSource::Api,
+                        );
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(t.fleet_max("m").unwrap().as_str(), "200");
+        assert_eq!(t.len(), 8);
     }
 }
