@@ -32,6 +32,11 @@ metrics = "0.24.6"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "filter"
+harness = false
 
 [lints]
 workspace = true

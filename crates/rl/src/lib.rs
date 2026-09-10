@@ -27,7 +27,7 @@ pub use error::RlError;
 pub use metrics::init_rl_metrics;
 pub use policy::{VersionPolicy, VersionPolicyError, VERSION_POLICY_HEADER};
 pub use state::RlState;
-pub use table::{ControlState, RlTable, VersionEvictionSink, VersionSource};
+pub use table::{ControlState, FilterReason, RlTable, VersionEvictionSink, VersionSource};
 pub use version::Version;
 pub use view::{RlWorkerInfo, RlWorkerView};
 

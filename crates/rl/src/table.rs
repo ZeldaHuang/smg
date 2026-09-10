@@ -9,7 +9,7 @@ use std::sync::{
 
 use dashmap::DashMap;
 
-use crate::{metrics, version::Version};
+use crate::{metrics, policy::VersionPolicy, version::Version};
 
 /// Whether an engine can serve requests, as last observed through SMG.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -95,6 +95,27 @@ fn fresh(model: &str) -> EngineState {
         version: None,
         version_source: None,
         control: ControlState::Active,
+    }
+}
+
+/// Why a candidate was dropped; the `reason` label of
+/// `smg_rl_candidates_filtered_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterReason {
+    Paused,
+    Asleep,
+    Stale,
+    Unversioned,
+}
+
+impl FilterReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Paused => "paused",
+            Self::Asleep => "asleep",
+            Self::Stale => "stale",
+            Self::Unversioned => "unversioned",
+        }
     }
 }
 
@@ -284,13 +305,26 @@ impl RlTable {
     /// Scan the model's entries; fleets are small and this runs on writes
     /// only. Always called with `writes` held: the scan-then-store here is
     /// not atomic on its own.
+    ///
+    /// Prefers the numeric maximum when the fleet has any numeric version:
+    /// `Version`'s `Ord` falls back to a lexical compare across a
+    /// numeric/text pair, so a stray checkpoint label like `ckpt-7` would
+    /// otherwise outrank every numbered release just because `'c' > '1'`
+    /// byte-wise, corrupting the staleness baseline for the whole model.
+    /// Only when every version for the model is text does that lexical
+    /// order stand, matching `Version`'s own documented text-vs-text
+    /// ordering.
     fn recompute_fleet_max(&self, model: &str) {
-        let max = self
-            .entries
-            .iter()
-            .filter(|e| &*e.model == model)
-            .filter_map(|e| e.version.clone())
-            .max();
+        let versions_of_model = || {
+            self.entries
+                .iter()
+                .filter(|e| &*e.model == model)
+                .filter_map(|e| e.version.clone())
+        };
+        let max = versions_of_model()
+            .filter(|v| v.numeric().is_some())
+            .max()
+            .or_else(|| versions_of_model().max());
         match max {
             Some(v) => {
                 self.fleet_max.insert(Arc::from(model), v);
@@ -308,6 +342,87 @@ impl RlTable {
             .filter(|e| e.control != ControlState::Active)
             .count();
         self.inactive.store(n, Ordering::Relaxed);
+    }
+
+    /// Indices of `candidates` (as `(model_id, base_url)` pairs) that stay
+    /// eligible under `policy`; `None` when every candidate is eligible, so
+    /// the common case allocates nothing. Paused and asleep engines are
+    /// dropped under every policy.
+    pub fn eligible<'a, I>(&self, candidates: I, policy: &VersionPolicy) -> Option<Vec<usize>>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        if *policy == VersionPolicy::Any && self.inactive.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let iter = candidates.into_iter();
+        let total = iter.len();
+        let mut keep = Vec::with_capacity(total);
+        let mut cached_max: Option<(&'a str, Option<Version>)> = None;
+        for (idx, (model, base_url)) in iter.enumerate() {
+            let (control, version) = match self.entries.get(base_url) {
+                Some(e) => (e.control, e.version.clone()),
+                None => (ControlState::Active, None),
+            };
+            let verdict = match control {
+                ControlState::Paused => Err(FilterReason::Paused),
+                ControlState::Asleep => Err(FilterReason::Asleep),
+                ControlState::Active if *policy == VersionPolicy::Any => Ok(()),
+                ControlState::Active => {
+                    let fleet_max = match &cached_max {
+                        Some((m, max)) if *m == model => max.clone(),
+                        _ => {
+                            let max = self.fleet_max(model);
+                            cached_max = Some((model, max.clone()));
+                            max
+                        }
+                    };
+                    Self::judge(policy, version.as_ref(), fleet_max.as_ref())
+                }
+            };
+            match verdict {
+                Ok(()) => keep.push(idx),
+                Err(reason) => metrics::record_candidate_filtered(reason.as_str()),
+            }
+        }
+        if keep.is_empty() {
+            metrics::record_request_unroutable();
+        }
+        if keep.len() == total {
+            None
+        } else {
+            Some(keep)
+        }
+    }
+
+    fn judge(
+        policy: &VersionPolicy,
+        version: Option<&Version>,
+        fleet_max: Option<&Version>,
+    ) -> Result<(), FilterReason> {
+        match policy {
+            VersionPolicy::Any => Ok(()),
+            VersionPolicy::LatestOnly => match (version, fleet_max) {
+                (_, None) => Ok(()),
+                (None, Some(_)) => Err(FilterReason::Unversioned),
+                (Some(v), Some(max)) if v == max => Ok(()),
+                (Some(_), Some(_)) => Err(FilterReason::Stale),
+            },
+            VersionPolicy::MaxStaleness(k) => match (version, fleet_max) {
+                (_, None) => Ok(()),
+                (None, Some(_)) => Err(FilterReason::Unversioned),
+                (Some(v), Some(max)) => match (v.numeric(), max.numeric()) {
+                    (Some(v), Some(max)) if max.saturating_sub(v) <= *k => Ok(()),
+                    _ => Err(FilterReason::Stale),
+                },
+            },
+            VersionPolicy::MinVersion(floor) => match version {
+                None => Err(FilterReason::Unversioned),
+                Some(v) if v >= floor => Ok(()),
+                Some(_) => Err(FilterReason::Stale),
+            },
+        }
     }
 }
 
@@ -473,6 +588,124 @@ mod tests {
             sink.0.lock().unwrap().last(),
             Some(&("real-model".to_string(), "http://a:1".to_string()))
         );
+    }
+
+    fn candidates<'a>(urls: &'a [&'a str]) -> Vec<(&'a str, &'a str)> {
+        urls.iter().map(|u| ("m", *u)).collect()
+    }
+
+    #[test]
+    fn any_with_every_engine_active_is_the_allocation_free_path() {
+        let (t, _) = table();
+        t.seed("http://a:1", "m", Some("1"));
+        t.seed("http://b:1", "m", Some("2"));
+        assert_eq!(
+            t.eligible(
+                candidates(&["http://a:1", "http://b:1"]),
+                &VersionPolicy::Any
+            ),
+            None
+        );
+        // Unknown engines are eligible too.
+        assert_eq!(
+            t.eligible(candidates(&["http://zz:1"]), &VersionPolicy::Any),
+            None
+        );
+    }
+
+    #[test]
+    fn paused_and_asleep_engines_are_dropped_under_every_policy() {
+        let (t, _) = table();
+        t.seed("http://a:1", "m", Some("2"));
+        t.seed("http://b:1", "m", Some("2"));
+        t.seed("http://c:1", "m", Some("2"));
+        t.set_control("http://a:1", "m", ControlState::Paused);
+        t.set_control("http://c:1", "m", ControlState::Asleep);
+        let c = candidates(&["http://a:1", "http://b:1", "http://c:1"]);
+        assert_eq!(t.eligible(c.clone(), &VersionPolicy::Any), Some(vec![1]));
+        assert_eq!(
+            t.eligible(c.clone(), &VersionPolicy::LatestOnly),
+            Some(vec![1])
+        );
+        t.set_control("http://b:1", "m", ControlState::Paused);
+        assert_eq!(t.eligible(c, &VersionPolicy::Any), Some(vec![]));
+    }
+
+    #[test]
+    fn latest_only_keeps_the_fleet_max_and_everyone_when_nobody_is_versioned() {
+        let (t, _) = table();
+        t.seed("http://a:1", "m", None);
+        t.seed("http://b:1", "m", None);
+        let c = candidates(&["http://a:1", "http://b:1"]);
+        assert_eq!(
+            t.eligible(c.clone(), &VersionPolicy::LatestOnly),
+            None,
+            "nothing is stale yet"
+        );
+        t.set_version("http://a:1", "m", Version::parse("1"), VersionSource::Api);
+        assert_eq!(
+            t.eligible(c.clone(), &VersionPolicy::LatestOnly),
+            Some(vec![0]),
+            "unversioned b is behind"
+        );
+        t.set_version("http://b:1", "m", Version::parse("2"), VersionSource::Api);
+        assert_eq!(
+            t.eligible(c.clone(), &VersionPolicy::LatestOnly),
+            Some(vec![1]),
+            "a is stale"
+        );
+        t.set_version("http://a:1", "m", Version::parse("2"), VersionSource::Api);
+        assert_eq!(t.eligible(c, &VersionPolicy::LatestOnly), None);
+    }
+
+    #[test]
+    fn max_staleness_and_min_version_evaluate_numerically() {
+        let (t, _) = table();
+        for (url, v) in [
+            ("http://a:1", "10"),
+            ("http://b:1", "9"),
+            ("http://c:1", "7"),
+        ] {
+            t.set_version(url, "m", Version::parse(v), VersionSource::Api);
+        }
+        t.seed("http://d:1", "m", None);
+        let c = candidates(&["http://a:1", "http://b:1", "http://c:1", "http://d:1"]);
+        assert_eq!(
+            t.eligible(c.clone(), &VersionPolicy::MaxStaleness(1)),
+            Some(vec![0, 1])
+        );
+        assert_eq!(
+            t.eligible(c.clone(), &VersionPolicy::MaxStaleness(3)),
+            Some(vec![0, 1, 2])
+        );
+        assert_eq!(
+            t.eligible(c.clone(), &VersionPolicy::MinVersion(Version::parse("9"))),
+            Some(vec![0, 1])
+        );
+        assert_eq!(
+            t.eligible(c.clone(), &VersionPolicy::MinVersion(Version::parse("7"))),
+            Some(vec![0, 1, 2])
+        );
+        // A text version cannot satisfy a numeric staleness bound.
+        t.set_version(
+            "http://c:1",
+            "m",
+            Version::parse("ckpt-7"),
+            VersionSource::Api,
+        );
+        assert_eq!(
+            t.eligible(c, &VersionPolicy::MaxStaleness(100)),
+            Some(vec![0, 1])
+        );
+    }
+
+    #[test]
+    fn fleet_max_is_per_model() {
+        let (t, _) = table();
+        t.set_version("http://a:1", "m", Version::parse("5"), VersionSource::Api);
+        t.set_version("http://b:1", "n", Version::parse("1"), VersionSource::Api);
+        let c = vec![("m", "http://a:1"), ("n", "http://b:1")];
+        assert_eq!(t.eligible(c, &VersionPolicy::LatestOnly), None);
     }
 
     #[test]
