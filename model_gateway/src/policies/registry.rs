@@ -17,8 +17,8 @@ use tracing::{debug, info, warn};
 use super::{
     get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
-    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
+    BucketPolicy, CacheAwarePolicy, CandidateFilter, DPRankLoadPolicy, LoadBalancingPolicy,
+    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
@@ -74,6 +74,10 @@ pub struct PolicyRegistry {
 
     // DP-rank policy: Supports the selection of dp-rank outside the engine.
     dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
+
+    /// Optional pre-policy candidate filter (see [`CandidateFilter`]), set
+    /// once at startup like the PD leg policies.
+    candidate_filter: Arc<OnceLock<Arc<dyn CandidateFilter>>>,
 
     /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
@@ -161,6 +165,7 @@ impl PolicyRegistry {
             load_rx: Arc::new(RwLock::new(None)),
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
+            candidate_filter: Arc::new(OnceLock::new()),
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
@@ -251,8 +256,35 @@ impl PolicyRegistry {
     /// enabled, the request carries a key from the configured source, and the
     /// configured policy does not already honor the key (`manual` /
     /// `consistent_hashing`). Otherwise delegates to `policy`. `policy.name()`
-    /// stays the real policy (for metrics).
+    /// stays the real policy (for metrics). A candidate filter, when
+    /// installed, narrows `workers` first; the returned index always refers
+    /// to the caller's slice.
     pub fn select_worker(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        if let Some(filter) = self.candidate_filter.get() {
+            if let Some(keep) = filter.eligible(workers, info.headers) {
+                if keep.is_empty() {
+                    return None;
+                }
+                if keep.len() < workers.len() {
+                    let subset: Vec<Arc<dyn Worker>> =
+                        keep.iter().map(|&i| Arc::clone(&workers[i])).collect();
+                    return self
+                        .select_unfiltered(policy, &subset, info)
+                        .and_then(|i| keep.get(i).copied());
+                }
+            }
+        }
+        self.select_unfiltered(policy, workers, info)
+    }
+
+    /// Today's selection: the sticky routing-key override when it applies,
+    /// else the policy.
+    fn select_unfiltered(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
         workers: &[Arc<dyn Worker>],
@@ -693,6 +725,16 @@ impl PolicyRegistry {
         self.dp_rank_policy.get().map(Arc::clone)
     }
 
+    /// Install the candidate filter. Returns `false` (and keeps the first)
+    /// when one was already set.
+    pub fn set_candidate_filter(&self, filter: Arc<dyn CandidateFilter>) -> bool {
+        self.candidate_filter.set(filter).is_ok()
+    }
+
+    pub fn has_candidate_filter(&self) -> bool {
+        self.candidate_filter.get().is_some()
+    }
+
     /// Set the decode policy for PD mode (lock-free, set once at startup)
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
         // OnceLock::set returns Err if already set, which we ignore since
@@ -979,7 +1021,7 @@ impl std::fmt::Debug for PolicyRegistry {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::HealthCheckConfig;
+    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
     use tracing_test::traced_test;
 
     use super::*;
@@ -2058,5 +2100,89 @@ mod tests {
 
         registry.remove_worker_from_pd_cache_aware("http://prefill-1:8000");
         registry.remove_worker_from_pd_cache_aware("http://decode-1:8000");
+    }
+
+    struct KeepIndices(Option<Vec<usize>>);
+
+    impl CandidateFilter for KeepIndices {
+        fn eligible(
+            &self,
+            _workers: &[Arc<dyn Worker>],
+            _headers: Option<&HeaderMap>,
+        ) -> Option<Vec<usize>> {
+            self.0.clone()
+        }
+    }
+
+    fn three_workers() -> Vec<Arc<dyn Worker>> {
+        ["http://w1:1", "http://w2:1", "http://w3:1"]
+            .iter()
+            .map(|url| {
+                let w: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(*url)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                );
+                w.set_status(WorkerStatus::Ready);
+                w
+            })
+            .collect()
+    }
+
+    #[test]
+    fn candidate_filter_remaps_indices_into_the_callers_slice() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert!(registry.set_candidate_filter(Arc::new(KeepIndices(Some(vec![2])))));
+        assert!(
+            !registry.set_candidate_filter(Arc::new(KeepIndices(None))),
+            "set once"
+        );
+        let workers = three_workers();
+        let policy = registry.get_policy_or_default("m");
+        for _ in 0..4 {
+            assert_eq!(
+                registry.select_worker(&policy, &workers, &SelectWorkerInfo::default()),
+                Some(2)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_eligible_set_selects_nothing() {
+        let registry = PolicyRegistry::new(PolicyConfig::Random);
+        registry.set_candidate_filter(Arc::new(KeepIndices(Some(vec![]))));
+        let workers = three_workers();
+        let policy = registry.get_policy_or_default("m");
+        assert_eq!(
+            registry.select_worker(&policy, &workers, &SelectWorkerInfo::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_filter_that_keeps_everything_changes_nothing() {
+        for config in [
+            PolicyConfig::RoundRobin,
+            PolicyConfig::Random,
+            PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 60,
+            },
+        ] {
+            let plain = PolicyRegistry::new(config.clone());
+            let filtered = PolicyRegistry::new(config);
+            filtered.set_candidate_filter(Arc::new(KeepIndices(None)));
+            let workers = three_workers();
+            let info = SelectWorkerInfo::default();
+            // Round robin is deterministic; random/p2 are checked for validity only.
+            let a = plain.select_worker(&plain.get_policy_or_default("m"), &workers, &info);
+            let b = filtered.select_worker(&filtered.get_policy_or_default("m"), &workers, &info);
+            assert!(a.is_some() && b.is_some());
+            if plain.get_policy_or_default("m").name() == "round_robin" {
+                assert_eq!(a, b);
+            }
+        }
     }
 }
