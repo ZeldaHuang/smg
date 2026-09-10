@@ -944,6 +944,7 @@ impl Router {
                 enabled: self.enable_rl,
                 control_timeout_secs: self.rl_control_timeout_secs,
                 fanout_concurrency: self.rl_fanout_concurrency,
+                version_policy: smg_rl::VersionPolicy::default(),
             })
             .maybe_client_cert_and_key(
                 self.client_cert_path.as_ref(),

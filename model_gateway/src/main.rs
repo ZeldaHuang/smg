@@ -1958,6 +1958,7 @@ impl CliArgs {
                 enabled: self.enable_rl,
                 control_timeout_secs: self.rl_control_timeout_secs,
                 fanout_concurrency: self.rl_fanout_concurrency,
+                version_policy: smg_rl::VersionPolicy::default(),
             })
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());

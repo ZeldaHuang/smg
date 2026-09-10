@@ -2292,6 +2292,7 @@ mod tests {
                 enabled: true,
                 control_timeout_secs: 0,
                 fanout_concurrency: 32,
+                version_policy: smg_rl::VersionPolicy::default(),
             })
             .build_unchecked();
         let err = ConfigValidator::validate(&bad).unwrap_err().to_string();
