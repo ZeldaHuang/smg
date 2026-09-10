@@ -14,6 +14,7 @@ pub mod path;
 pub mod policy;
 pub mod proxy;
 pub mod selector;
+pub mod stamp;
 pub mod state;
 pub mod table;
 #[cfg(test)]
