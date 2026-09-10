@@ -283,6 +283,7 @@ mod tests {
             enabled: true,
             control_timeout_secs: timeout_secs,
             fanout_concurrency: 4,
+            ..RlConfig::default()
         };
         Arc::new(RlState::new(Arc::new(FakeView(workers)), cfg))
     }

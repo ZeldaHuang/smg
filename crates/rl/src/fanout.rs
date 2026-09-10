@@ -173,6 +173,7 @@ mod tests {
             enabled: true,
             control_timeout_secs: 5,
             fanout_concurrency: concurrency,
+            ..RlConfig::default()
         };
         Arc::new(RlState::new(Arc::new(FakeView(workers)), cfg))
     }

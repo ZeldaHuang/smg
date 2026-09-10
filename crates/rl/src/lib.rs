@@ -13,6 +13,7 @@ pub mod policy;
 pub mod proxy;
 pub mod selector;
 pub mod state;
+pub mod table;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod version;
@@ -26,6 +27,7 @@ pub use error::RlError;
 pub use metrics::init_rl_metrics;
 pub use policy::{VersionPolicy, VersionPolicyError, VERSION_POLICY_HEADER};
 pub use state::RlState;
+pub use table::{ControlState, RlTable, VersionEvictionSink, VersionSource};
 pub use version::Version;
 pub use view::{RlWorkerInfo, RlWorkerView};
 
