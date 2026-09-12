@@ -109,7 +109,7 @@ mod tests {
     fn text_versions_compare_lexically() {
         assert!(Version::parse("step-9") > Version::parse("step-10"));
         assert_eq!(Version::parse("abc").numeric(), None);
-        assert_ne!(Version::parse("abc"), Version::parse("abd"));
+        assert_ne!(Version::parse("abc"), Version::parse("acd"));
     }
 
     #[test]

@@ -56,7 +56,7 @@ fn is_mixed(meta: &MetaProbe, expected: Option<&Version>) -> bool {
 /// Whether a buffered `/generate` body (one object, or an array for `n > 1`)
 /// spans more than one weight version or reports a version other than
 /// `expected`. Only `meta_info.weight_version` and the span count are read;
-/// an unparseable body is not mixed.
+/// an unparsable body is not mixed.
 pub fn generate_is_mixed(body: &[u8], expected: Option<&Version>) -> bool {
     let first = body.iter().find(|b| !b.is_ascii_whitespace());
     match first {
