@@ -360,6 +360,8 @@ impl MockWorker {
             .route("/continue_generation", post(rl_control_handler))
             .route("/update_weights_from_disk", post(rl_control_handler))
             .route("/update_weight_version", post(rl_control_handler))
+            .route("/release_memory_occupation", post(rl_control_handler))
+            .route("/resume_memory_occupation", post(rl_control_handler))
             .route("/pause", post(rl_control_handler))
             .route("/resume", post(rl_control_handler))
             .route("/v1/loads", get(loads_handler))
