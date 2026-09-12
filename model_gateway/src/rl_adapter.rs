@@ -1,17 +1,29 @@
 //! Glue between the RL control plane crate and the gateway. This file is the
-//! whole of coupling surfaces (a) and (b); see `crates/rl/COUPLING.md`.
+//! whole of coupling surfaces (a), (b), and the stamping half of (c); see
+//! `crates/rl/COUPLING.md`.
 
 use std::sync::{Arc, Weak};
 
-use http::HeaderMap;
+use axum::{
+    body::{to_bytes, Body},
+    extract::{Request, State},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
+use http::{header::CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use http_body::Body as _;
 use openai_protocol::worker::ConnectionMode;
-use smg_rl::{RlState, RlWorkerInfo, RlWorkerView, VersionEvictionSink};
+use smg_rl::{
+    stamp::generate_is_mixed, table::base_url_of, RlError, RlState, RlWorkerInfo, RlWorkerView,
+    VersionEvictionSink, VersionPolicy,
+};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, warn};
 
 use crate::{
     config::RouterConfig,
     policies::{CandidateFilter, PolicyRegistry},
+    routers::{common::header_utils::RoutedWorker, error},
     worker::{event::WorkerEvent, registry::WorkerId, Worker, WorkerRegistry},
 };
 
@@ -246,6 +258,73 @@ pub fn build_rl_state(
     }
     spawn_table_maintainer(Arc::downgrade(&rl), Arc::clone(registry));
     Some(rl)
+}
+
+/// The version SMG believed the routed engine held when it answered.
+static WEIGHT_VERSION: HeaderName = HeaderName::from_static(smg_rl::stamp::WEIGHT_VERSION_HEADER);
+/// Set when a buffered `/generate` body spanned more than one version.
+static MIXED_VERSION: HeaderName = HeaderName::from_static(smg_rl::stamp::MIXED_VERSION_HEADER);
+
+fn is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("json"))
+}
+
+/// Coupling (c): validate the per-request version policy, stamp every served
+/// response with the engine's version, and flag buffered `/generate` bodies
+/// that spanned two versions. Mounted only when `--enable-rl` is on.
+///
+/// A streamed body is never read: `size_hint().exact()` is `None` for it, so
+/// the mixed-version probe is skipped rather than buffering a generation.
+pub async fn rl_middleware(
+    State(rl): State<Arc<RlState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Err(e) = VersionPolicy::from_headers(request.headers()) {
+        return RlError::InvalidVersionPolicy(e.to_string()).into_response();
+    }
+    // The request is consumed by `next`, so decide on the path now.
+    let inspect_body = request.uri().path() == "/generate";
+    let mut response = next.run(request).await;
+    // Set by the gateway alone, so it names the engine that actually served
+    // this response — no upstream header can forge it.
+    let Some(routed) = response.extensions().get::<RoutedWorker>().cloned() else {
+        return response;
+    };
+    let version = rl.table().version_of(base_url_of(&routed.0));
+    if let Some(value) = version
+        .as_ref()
+        .and_then(|v| HeaderValue::from_str(v.as_str()).ok())
+    {
+        response.headers_mut().insert(WEIGHT_VERSION.clone(), value);
+    }
+    let buffered = response.body().size_hint().exact().is_some();
+    if !(inspect_body && response.status().is_success() && is_json(response.headers()) && buffered)
+    {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let limit = body.size_hint().exact().map_or(0, |n| n as usize);
+    match to_bytes(body, limit).await {
+        Ok(bytes) => {
+            let mixed = generate_is_mixed(&bytes, version.as_ref());
+            let mut response = Response::from_parts(parts, Body::from(bytes));
+            if mixed {
+                response
+                    .headers_mut()
+                    .insert(MIXED_VERSION.clone(), HeaderValue::from_static("true"));
+                smg_rl::metrics::record_mixed_version();
+            }
+            response
+        }
+        Err(e) => {
+            warn!(error = %e, "RL middleware could not re-read a buffered generate body");
+            error::internal_error("read_response_body_failed", "Failed to read response body")
+        }
+    }
 }
 
 #[cfg(test)]

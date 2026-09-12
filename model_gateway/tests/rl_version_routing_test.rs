@@ -316,3 +316,145 @@ async fn flag_off_ignores_the_policy_header_and_stamps_nothing() {
     assert!(!ctx.app_context.policy_registry.has_candidate_filter());
     ctx.shutdown().await;
 }
+
+#[tokio::test]
+async fn header_override_and_invalid_header() {
+    let ctx = ctx("any", vec![mock(18928), mock(18929)]).await;
+    let app = ctx.create_app();
+    let ws = workers(&app).await;
+    post_json(
+        &app,
+        &format!("/v1/rl/workers/{}/version", ws[0].0),
+        json!({"weight_version": "2"}),
+    )
+    .await;
+    post_json(
+        &app,
+        &format!("/v1/rl/workers/{}/version", ws[1].0),
+        json!({"weight_version": "1"}),
+    )
+    .await;
+    assert_eq!(
+        routed_over(&app, 8, None).await.len(),
+        2,
+        "configured policy is any"
+    );
+    assert_eq!(
+        routed_over(&app, 8, Some(("x-smg-version-policy", "latest-only"))).await,
+        BTreeSet::from([ws[0].1.clone()])
+    );
+    assert_eq!(
+        routed_over(&app, 8, Some(("x-smg-version-policy", "max-staleness:1")))
+            .await
+            .len(),
+        2
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/generate")
+                .header("content-type", "application/json")
+                .header("x-smg-version-policy", "newest")
+                .body(Body::from(json!({"text": "hi"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_of(resp).await["error"], "invalid_version_policy");
+    ctx.shutdown().await;
+}
+
+#[tokio::test]
+async fn responses_carry_the_weight_version_once_known() {
+    let ctx = ctx("any", vec![mock(18932)]).await;
+    let app = ctx.create_app();
+    let ws = workers(&app).await;
+    let gen = |stream: bool| json!({"text": "hi", "stream": stream});
+
+    let resp = post_json(&app, "/generate", gen(false)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("x-smg-weight-version").is_none(),
+        "unversioned engine: no header"
+    );
+
+    post_json(
+        &app,
+        &format!("/v1/rl/workers/{}/version", ws[0].0),
+        json!({"weight_version": "9"}),
+    )
+    .await;
+    for (uri, body) in [
+        ("/generate", gen(false)),
+        ("/generate", gen(true)),
+        (
+            "/v1/chat/completions",
+            json!({"model": "mock-model", "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "mock-model", "stream": true,
+                   "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+    ] {
+        let resp = post_json(&app, uri, body).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        assert_eq!(resp.headers()["x-smg-weight-version"], "9", "{uri}");
+        assert_eq!(resp.headers()["x-smg-routed-worker-id"], ws[0].1.as_str());
+    }
+    ctx.shutdown().await;
+}
+
+#[tokio::test]
+async fn buffered_generate_flags_mixed_versions() {
+    let ctx = ctx("any", vec![mock(18933)]).await;
+    let app = ctx.create_app();
+    let ws = workers(&app).await;
+    post_json(
+        &app,
+        &format!("/v1/rl/workers/{}/version", ws[0].0),
+        json!({"weight_version": "9"}),
+    )
+    .await;
+
+    let mixed = json!({"text": "hi", "mock_meta_info": {"weight_version": "9", "weight_versions": [
+        {"version": "8", "start": 0, "end": 3}, {"version": "9", "start": 3, "end": 5}]}});
+    let resp = post_json(&app, "/generate", mixed).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-smg-mixed-version"], "true");
+    assert_eq!(resp.headers()["x-smg-weight-version"], "9");
+    let body = json_of(resp).await;
+    assert_eq!(
+        body["meta_info"]["weight_versions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "body untouched"
+    );
+
+    let clean = json!({"text": "hi", "mock_meta_info": {"weight_version": "9"}});
+    let resp = post_json(&app, "/generate", clean).await;
+    assert!(resp.headers().get("x-smg-mixed-version").is_none());
+
+    let drifted = json!({"text": "hi", "mock_meta_info": {"weight_version": "7"}});
+    let resp = post_json(&app, "/generate", drifted).await;
+    assert_eq!(resp.headers()["x-smg-mixed-version"], "true");
+
+    let streamed =
+        json!({"text": "hi", "stream": true, "mock_meta_info": {"weight_versions": [1, 2]}});
+    let resp = post_json(&app, "/generate", streamed).await;
+    assert!(
+        resp.headers().get("x-smg-mixed-version").is_none(),
+        "streams are never inspected"
+    );
+    // The engine really did report two spans, so the header's absence is the
+    // middleware declining to read a stream, not the mock declining the hook.
+    let events = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        String::from_utf8_lossy(&events).contains("weight_versions"),
+        "the streamed events carry the mixed-version metadata"
+    );
+    ctx.shutdown().await;
+}
