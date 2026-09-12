@@ -386,6 +386,52 @@ mod tests {
         assert!(rl.table().get("http://engine-b:30000").is_some());
     }
 
+    /// One engine, many registry entries: a DP group's ranks share a base
+    /// URL and one table entry, so a single rank leaving must not take the
+    /// engine's version with it — only the last one does.
+    #[tokio::test]
+    async fn removing_one_dp_rank_keeps_the_engines_entry() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let rl = build_rl_state(&registry, &policy_registry, &rl_enabled_config())
+            .expect("rl is enabled");
+
+        for rank in 0..2 {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("http://engine:30000")
+                    .dp_config(rank, 2)
+                    .label("weight_version", "5")
+                    .build(),
+            );
+            registry.register(worker);
+        }
+        settle().await;
+        let entry = rl
+            .table()
+            .get("http://engine:30000")
+            .expect("both ranks seed the one engine entry");
+        assert_eq!(entry.version, Some(Version::parse("5")));
+
+        registry.remove_by_url("http://engine:30000@0");
+        settle().await;
+        let entry = rl
+            .table()
+            .get("http://engine:30000")
+            .expect("rank 1 still serves this engine");
+        assert_eq!(
+            entry.version,
+            Some(Version::parse("5")),
+            "a departing rank must not reset the engine's version"
+        );
+
+        registry.remove_by_url("http://engine:30000@1");
+        settle().await;
+        assert!(
+            rl.table().get("http://engine:30000").is_none(),
+            "the last rank leaving drops the engine"
+        );
+    }
+
     /// Let the maintainer task drain the event stream.
     async fn settle() {
         for _ in 0..16 {

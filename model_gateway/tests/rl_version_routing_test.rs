@@ -160,10 +160,14 @@ async fn asleep_via_api_and_via_intercepted_release_get_no_dispatches() {
             .unwrap(),
     )
     .await;
-    assert!(
-        listed.to_string().matches("\"ready\"").count() >= 3,
-        "still ready to the registry: {listed}"
-    );
+    // Control state is RL's alone: the health machine still calls all three
+    // ready, so nothing the gateway does to a sleeping engine leaks into the
+    // registry's own view of it.
+    let listed = listed["workers"].as_array().expect("workers array");
+    assert_eq!(listed.len(), 3);
+    for worker in listed {
+        assert_eq!(worker["status"], "ready", "{worker}");
+    }
 
     // Wake them: API for w0, intercepted resume for w1.
     post_json(
@@ -217,10 +221,12 @@ async fn rolling_update_under_latest_only_never_dispatches_to_a_stale_worker() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let routed = routed_over(&app, 8, None).await;
-    assert!(
-        routed.is_subset(&BTreeSet::from([ws[0].1.clone(), ws[1].1.clone()])),
-        "{routed:?}"
+    // Both refit workers, and only those two: an equality here is what proves
+    // the interceptor recorded the proxied call — a subset check would also
+    // pass if `ws[1]` had never been observed at version 2.
+    assert_eq!(
+        routed_over(&app, 8, None).await,
+        BTreeSet::from([ws[0].1.clone(), ws[1].1.clone()])
     );
 
     let resp = post_json(
