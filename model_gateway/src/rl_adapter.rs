@@ -1,7 +1,7 @@
 //! Glue between the RL control plane crate and the gateway. This file is the
 //! whole of coupling surfaces (a) and (b); see `crates/rl/COUPLING.md`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use http::HeaderMap;
 use openai_protocol::worker::ConnectionMode;
@@ -84,20 +84,31 @@ impl RlWorkerView for RegistryRlView {
 ///
 /// Called with the RL table's write mutex held, so it must never write back
 /// into the table — resetting policy caches is the whole of its work.
+///
+/// Both handles are weak. The policy registry owns the candidate filter,
+/// which owns the [`RlState`] this sink lives in, so a strong handle here
+/// would close an ownership cycle and leak both registries (and the
+/// maintainer task with them) for the life of the process.
 struct RegistryEvictionSink {
-    registry: Arc<WorkerRegistry>,
-    policy_registry: Arc<PolicyRegistry>,
+    registry: Weak<WorkerRegistry>,
+    policy_registry: Weak<PolicyRegistry>,
 }
 
 impl VersionEvictionSink for RegistryEvictionSink {
     fn on_version_changed(&self, _model_id: &str, base_url: &str) {
-        for worker in self
-            .registry
+        // Either one gone means the gateway is tearing down: there is no
+        // cache left to reset.
+        let (Some(registry), Some(policy_registry)) =
+            (self.registry.upgrade(), self.policy_registry.upgrade())
+        else {
+            return;
+        };
+        for worker in registry
             .get_all()
             .iter()
             .filter(|w| w.base_url() == base_url)
         {
-            self.policy_registry.reset_worker_cache(worker.as_ref());
+            policy_registry.reset_worker_cache(worker.as_ref());
         }
     }
 }
@@ -150,7 +161,7 @@ fn resync(rl: &RlState, registry: &WorkerRegistry) {
 /// on `Replaced` only when the discovered label changed (a property patch
 /// must not reset an observed version), drop on the last `Removed` for an
 /// engine. Runs only when a Tokio runtime is current.
-fn spawn_table_maintainer(rl: Arc<RlState>, registry: Arc<WorkerRegistry>) {
+fn spawn_table_maintainer(rl: Weak<RlState>, registry: Arc<WorkerRegistry>) {
     if tokio::runtime::Handle::try_current().is_err() {
         warn!("RL table maintainer not started: no async runtime; versions seed lazily");
         return;
@@ -158,21 +169,33 @@ fn spawn_table_maintainer(rl: Arc<RlState>, registry: Arc<WorkerRegistry>) {
     // Subscribe before the initial pass so a registration racing this call is
     // either already in `get_all()` or still queued on the receiver.
     let mut rx = registry.subscribe_events();
-    resync(&rl, &registry);
+    // The caller still holds the state, so the initial pass runs against a
+    // strong handle. It happens before the loop, so workers registered before
+    // this call are in the table by the time it returns.
+    if let Some(state) = rl.upgrade() {
+        resync(&state, &registry);
+    }
+    // Every handle the task keeps is weak, so it never keeps the gateway
+    // alive: it exits when the registry drops (`Closed`) or the state does.
     let registry = Arc::downgrade(&registry);
     #[expect(
         clippy::disallowed_methods,
-        reason = "runs for the lifetime of the gateway and exits when the registry is dropped"
+        reason = "runs for the lifetime of the gateway and exits when the registry or the RL state is dropped"
     )]
     tokio::spawn(async move {
         loop {
-            match rx.recv().await {
-                Ok(WorkerEvent::Registered { worker, .. }) => seed(&rl, &worker),
+            let event = rx.recv().await;
+            let Some(state) = rl.upgrade() else {
+                break;
+            };
+            match event {
+                Ok(WorkerEvent::Registered { worker, .. }) => seed(&state, &worker),
                 Ok(WorkerEvent::Replaced { old, new, .. }) => {
                     if version_label(&old) == version_label(&new) {
-                        seed(&rl, &new);
+                        seed(&state, &new);
                     } else {
-                        rl.table()
+                        state
+                            .table()
                             .reseed(new.base_url(), new.model_id(), version_label(&new));
                     }
                 }
@@ -182,7 +205,7 @@ fn spawn_table_maintainer(rl: Arc<RlState>, registry: Arc<WorkerRegistry>) {
                     };
                     let base_url = worker.base_url();
                     if !registry.get_all().iter().any(|w| w.base_url() == base_url) {
-                        rl.table().remove(base_url);
+                        state.table().remove(base_url);
                     }
                 }
                 Ok(WorkerEvent::StatusChanged { .. }) => {}
@@ -191,7 +214,7 @@ fn spawn_table_maintainer(rl: Arc<RlState>, registry: Arc<WorkerRegistry>) {
                     let Some(registry) = registry.upgrade() else {
                         break;
                     };
-                    resync(&rl, &registry);
+                    resync(&state, &registry);
                 }
                 Err(RecvError::Closed) => break,
             }
@@ -212,8 +235,8 @@ pub fn build_rl_state(
     }
     let view = Arc::new(RegistryRlView::new(Arc::clone(registry)));
     let sink = Arc::new(RegistryEvictionSink {
-        registry: Arc::clone(registry),
-        policy_registry: Arc::clone(policy_registry),
+        registry: Arc::downgrade(registry),
+        policy_registry: Arc::downgrade(policy_registry),
     });
     let rl = Arc::new(RlState::with_sink(view, config.rl.clone(), sink));
     if !policy_registry.set_candidate_filter(Arc::new(RlCandidateFilter {
@@ -221,7 +244,7 @@ pub fn build_rl_state(
     })) {
         warn!("a candidate filter was already installed; RL routing filter not active");
     }
-    spawn_table_maintainer(Arc::clone(&rl), Arc::clone(registry));
+    spawn_table_maintainer(Arc::downgrade(&rl), Arc::clone(registry));
     Some(rl)
 }
 
@@ -429,6 +452,40 @@ mod tests {
             cache_aware.string_prefix_for_tenant(&model, text, worker.url()),
             "",
             "a refit must clear what the engine's cache no longer holds"
+        );
+    }
+
+    /// The gateway must not outlive itself: the policy registry owns the
+    /// candidate filter, which owns the state, which owns the sink — so the
+    /// sink's handles back to both registries have to be weak or nothing is
+    /// ever freed and the maintainer task never exits.
+    #[tokio::test]
+    async fn dropping_the_context_frees_the_registries() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let rl = build_rl_state(&registry, &policy_registry, &rl_enabled_config())
+            .expect("rl is enabled");
+
+        let weak_rl = Arc::downgrade(&rl);
+        let weak_registry = Arc::downgrade(&registry);
+        let weak_policies = Arc::downgrade(&policy_registry);
+
+        drop(rl);
+        drop(registry);
+        drop(policy_registry);
+        settle().await;
+
+        assert!(
+            weak_policies.upgrade().is_none(),
+            "the policy registry outlived the context"
+        );
+        assert!(
+            weak_rl.upgrade().is_none(),
+            "the RL state outlived the context"
+        );
+        assert!(
+            weak_registry.upgrade().is_none(),
+            "the worker registry outlived the context"
         );
     }
 
