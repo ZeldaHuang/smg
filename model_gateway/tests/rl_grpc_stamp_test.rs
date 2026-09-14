@@ -1,17 +1,22 @@
 //! RL M2: the gRPC pipeline names the worker that served each response, and
 //! reports the version the RL table holds for that engine.
 //!
-//! The routers are driven directly (no axum app), so the RL middleware never
-//! runs here and `x-smg-weight-version` is not expected: what these tests pin
-//! is the pipeline's own half of the contract -- the routed-worker header and
-//! extension that the middleware keys on, and the live table version reaching
-//! the body as `system_fingerprint`.
+//! Most tests here drive the routers directly (no axum app), so the RL
+//! middleware never runs and `x-smg-weight-version` is not expected: what
+//! they pin is the pipeline's own half of the contract -- the routed-worker
+//! header and extension that the middleware keys on, and the live table
+//! version reaching the body as `system_fingerprint`. The last test closes
+//! the loop, driving the same pipeline through `build_app` so the middleware
+//! does run and the version header is asserted end to end.
 
 #[path = "common/mod.rs"]
 mod common;
 
 use std::{sync::Arc, time::Duration};
 
+use axum::body::Body;
+use http::{Request, StatusCode};
+use http_body_util::BodyExt as _;
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{
     chat::ChatCompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
@@ -25,6 +30,7 @@ use smg::{
     worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
 use tokio::net::TcpListener;
+use tower::ServiceExt as _;
 
 const MODEL: &str = "rl-grpc-stamp-test-model";
 /// Tokens the canned mock emits per request.
@@ -176,7 +182,7 @@ async fn a_buffered_grpc_response_names_its_worker_and_reports_the_live_version(
         .route_chat(None, &tenant(), chat_request(false), MODEL)
         .await;
 
-    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers()["x-smg-routed-worker-id"],
         url.as_str(),
@@ -211,7 +217,7 @@ async fn a_streamed_grpc_response_names_its_worker_and_reports_the_live_version(
         .route_chat(None, &tenant(), chat_request(true), MODEL)
         .await;
 
-    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers()["x-smg-routed-worker-id"],
         url.as_str(),
@@ -242,10 +248,80 @@ async fn an_unversioned_engine_still_stamps_and_falls_back_to_default() {
         .route_chat(None, &tenant(), chat_request(false), MODEL)
         .await;
 
-    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-smg-routed-worker-id"], url.as_str());
 
     let body = read_body(response).await;
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["system_fingerprint"], "default", "{body}");
+}
+
+/// The gRPC pipeline behind the real app, with every layer `build_app`
+/// installs -- including the RL middleware. The version is set the way an RL
+/// trainer sets it, through `POST /v1/rl/workers/{id}/version`, and comes
+/// back on the response as `x-smg-weight-version` next to the routed-worker
+/// stamp. The direct-router tests above cannot see this: they never build
+/// the app, so the middleware that reads the table and writes the header
+/// never runs.
+#[tokio::test]
+async fn the_app_stamps_the_control_plane_version_on_grpc_responses() {
+    let port = start_mock_grpc_worker().await;
+    let (router, ctx) = build_regular_router_with_rl(port).await;
+    let app = common::test_app::create_test_app_with_context(Arc::from(router), Arc::clone(&ctx));
+    let url = worker_url(port);
+
+    // The control plane addresses workers by registry id, not URL.
+    let listed = app
+        .clone()
+        .oneshot(Request::get("/v1/rl/workers").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: serde_json::Value =
+        serde_json::from_slice(&listed.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let id = listed["workers"][0]["id"]
+        .as_str()
+        .expect("the gRPC worker is listed by the RL control plane")
+        .to_string();
+
+    let set = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/rl/workers/{id}/version"))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"weight_version": "{LIVE_VERSION}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(set.status(), StatusCode::OK);
+
+    for stream in [false, true] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&chat_request(stream)).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+        assert_eq!(
+            response.headers()["x-smg-weight-version"],
+            LIVE_VERSION,
+            "the RL middleware must stamp the table's version; stream={stream}"
+        );
+        assert_eq!(
+            response.headers()["x-smg-routed-worker-id"],
+            url.as_str(),
+            "the response must still name the worker that served it; stream={stream}"
+        );
+    }
 }
