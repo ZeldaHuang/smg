@@ -22,22 +22,10 @@ use crate::{
     view::RlWorkerInfo,
 };
 
-/// Cap on an API-supplied version string.
-const MAX_VERSION_BYTES: usize = 128;
-
+/// The API write shares one validator with the passthrough observer, so a
+/// version SMG would refuse here cannot slip in through a proxied refit body.
 fn parse_version(raw: &str) -> Result<Version, RlError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(RlError::InvalidVersion(
-            "weight_version is empty".to_string(),
-        ));
-    }
-    if trimmed.len() > MAX_VERSION_BYTES {
-        return Err(RlError::InvalidVersion(format!(
-            "weight_version exceeds {MAX_VERSION_BYTES} bytes"
-        )));
-    }
-    Ok(Version::parse(trimmed))
+    Version::validated(raw).map_err(|e| RlError::InvalidVersion(e.to_string()))
 }
 
 fn body<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, RlError> {
@@ -257,6 +245,7 @@ mod tests {
 
         let long = "x".repeat(129);
         let resp = app
+            .clone()
             .oneshot(
                 Request::post("/workers/w1/version")
                     .header("content-type", "application/json")
@@ -266,6 +255,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(resp).await;
+        assert_eq!(body["error"], "invalid_version");
+        assert_eq!(body["message"], "weight_version exceeds 128 bytes");
+
+        // The shared validator also refuses anything outside printable ASCII,
+        // so a version that could never be stamped into a header is refused at
+        // the write rather than silently dropped at stamp time.
+        let resp = app
+            .oneshot(
+                Request::post("/workers/w1/version")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"weight_version": "v1\u0007"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(resp).await["error"], "invalid_version");
     }
 
     #[tokio::test]

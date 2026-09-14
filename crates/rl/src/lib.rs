@@ -34,7 +34,7 @@ pub use metrics::init_rl_metrics;
 pub use policy::{VersionPolicy, VersionPolicyError, VERSION_POLICY_HEADER};
 pub use state::RlState;
 pub use table::{ControlState, FilterReason, RlTable, VersionEvictionSink, VersionSource};
-pub use version::Version;
+pub use version::{Version, VersionError};
 pub use view::{RlWorkerInfo, RlWorkerView};
 
 /// Build the `/v1/rl` router. `with_state` returns `Router<S>` for any `S`,

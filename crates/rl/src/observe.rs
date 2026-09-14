@@ -4,6 +4,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::{table::ControlState, version::Version};
 
@@ -23,11 +24,46 @@ struct VersionProbe {
     new_version: Option<Value>,
 }
 
-fn version_field(value: Option<Value>) -> Option<Version> {
-    match value? {
-        Value::String(s) if !s.trim().is_empty() => Some(Version::parse(&s)),
-        Value::Number(n) => Some(Version::parse(&n.to_string())),
-        _ => None,
+/// A passthrough version gets exactly the validation the explicit API write
+/// gets (see [`Version::validated`]), so a refit body cannot put a value into
+/// the table that `POST /v1/rl/workers/<id>/version` would have refused. A
+/// rejected value observes nothing and says why, named by the route that
+/// carried it. An absent field stays silent: it says nothing about the engine.
+fn version_field(route: &str, value: Option<Value>) -> Option<Version> {
+    let raw = match value? {
+        Value::String(s) => s,
+        Value::Number(n) => n.to_string(),
+        other => {
+            warn!(
+                target: "smg_rl",
+                route, reason = "not_a_string_or_number", kind = kind_of(&other),
+                "ignoring a weight version an engine reported in an unusable JSON type"
+            );
+            return None;
+        }
+    };
+    match Version::validated(&raw) {
+        Ok(version) => Some(version),
+        Err(e) => {
+            warn!(
+                target: "smg_rl",
+                route, reason = e.reason(),
+                "ignoring an invalid weight version an engine reported"
+            );
+            None
+        }
+    }
+}
+
+/// The JSON type name for the rejection log. The value itself is never
+/// logged: a refit body is caller-supplied and may be large.
+fn kind_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::String(_) | Value::Number(_) => "scalar",
     }
 }
 
@@ -39,11 +75,11 @@ pub fn observe(path: &str, body: &[u8]) -> Option<Observation> {
         | "update_weights_from_tensor"
         | "update_weights_from_distributed" => {
             let probe: VersionProbe = serde_json::from_slice(body).ok()?;
-            version_field(probe.weight_version).map(Observation::Version)
+            version_field(path, probe.weight_version).map(Observation::Version)
         }
         "update_weight_version" => {
             let probe: VersionProbe = serde_json::from_slice(body).ok()?;
-            version_field(probe.new_version).map(Observation::Version)
+            version_field(path, probe.new_version).map(Observation::Version)
         }
         "pause_generation" | "pause" => Some(Observation::Control(ControlState::Paused)),
         "continue_generation" | "resume" | "resume_memory_occupation" | "wake_up" => {
@@ -104,6 +140,42 @@ mod tests {
             None,
             "wrong field for this route"
         );
+    }
+
+    /// Passthrough versions clear the same bar as the API write: a value the
+    /// control plane would answer `invalid_version` for observes nothing
+    /// rather than landing in the table through the proxy.
+    #[test]
+    fn a_rejected_passthrough_version_observes_nothing() {
+        let long = "x".repeat(129);
+        for body in [
+            r#"{"weight_version": "   "}"#.to_string(),
+            r#"{"weight_version": true}"#.to_string(),
+            r#"{"weight_version": ["42"]}"#.to_string(),
+            r#"{"weight_version": {"v": "42"}}"#.to_string(),
+            format!(r#"{{"weight_version": "{long}"}}"#),
+            r#"{"weight_version": "v1\u0007"}"#.to_string(),
+            r#"{"weight_version": "step 7"}"#.to_string(),
+        ] {
+            assert_eq!(
+                observe("update_weights_from_disk", body.as_bytes()),
+                None,
+                "{body}"
+            );
+        }
+        // The same bar on the other field shape.
+        for body in [
+            r#"{"new_version": "  "}"#,
+            r#"{"new_version": false}"#,
+            r#"{"new_version": []}"#,
+            r#"{"new_version": "v1\u0007"}"#,
+        ] {
+            assert_eq!(
+                observe("update_weight_version", body.as_bytes()),
+                None,
+                "{body}"
+            );
+        }
     }
 
     #[test]
