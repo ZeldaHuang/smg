@@ -18,7 +18,7 @@ use smg_rl::{
     VersionEvictionSink, VersionPolicy,
 };
 use tokio::sync::broadcast::error::RecvError;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::{
     config::RouterConfig,
@@ -222,7 +222,7 @@ fn spawn_table_maintainer(rl: Weak<RlState>, registry: Arc<WorkerRegistry>) {
                 }
                 Ok(WorkerEvent::StatusChanged { .. }) => {}
                 Err(RecvError::Lagged(n)) => {
-                    debug!(missed = n, "RL table maintainer lagged; resyncing");
+                    warn!(missed = n, "RL table maintainer lagged; resyncing");
                     let Some(registry) = registry.upgrade() else {
                         break;
                     };

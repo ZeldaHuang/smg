@@ -417,7 +417,10 @@ impl RlTable {
                 Err(reason) => metrics::record_candidate_filtered(reason.as_str()),
             }
         }
-        if keep.is_empty() {
+        // An empty candidate list is only "unroutable" when there was
+        // something to drop: a caller with no candidates at all already had
+        // nothing to route, and counting it here would blame the filter.
+        if keep.is_empty() && total > 0 {
             metrics::record_request_unroutable();
         }
         if keep.len() == total {
@@ -440,6 +443,11 @@ impl RlTable {
                 (Some(v), Some(max)) if v == max => Ok(()),
                 (Some(_), Some(_)) => Err(FilterReason::Stale),
             },
+            // Staleness is a numeric distance, so a version either side of
+            // the comparison that is not a `u64` has no distance to measure
+            // and counts as stale. That is the whole rule: the candidate is
+            // dropped under `FilterReason::Stale` like any other, with no
+            // separate log or metric for the non-numeric case.
             VersionPolicy::MaxStaleness(k) => match (version, fleet_max) {
                 (_, None) => Ok(()),
                 (None, Some(_)) => Err(FilterReason::Unversioned),
