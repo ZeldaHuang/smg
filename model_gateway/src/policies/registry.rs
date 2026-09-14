@@ -17,8 +17,8 @@ use tracing::{debug, info, warn};
 use super::{
     get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    BucketPolicy, CacheAwarePolicy, CandidateFilter, DPRankLoadPolicy, LoadBalancingPolicy,
-    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
+    BucketPolicy, CacheAwarePolicy, CandidateFilter, ConsistentHashingPolicy, DPRankLoadPolicy,
+    LoadBalancingPolicy, ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
@@ -26,7 +26,8 @@ use crate::{
     observability::metrics::Metrics,
     policies::cache_aware::LoadReceiver,
     routers::common::header_utils::{
-        extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
+        extract_routing_key_hint_named, extract_target_worker, parse_routing_tokens_hint,
+        ROUTING_KEY_HINT_MAX_BYTES,
     },
     worker::{KvEventMonitor, Worker},
 };
@@ -271,6 +272,15 @@ impl PolicyRegistry {
                     return None;
                 }
                 if keep.len() < workers.len() {
+                    // An explicit target index is answered against the
+                    // caller's slice before the subset is built; handing it
+                    // to the policy would silently rewrite which worker it
+                    // names. See `target_worker_under_filter`.
+                    if let Some(decision) =
+                        Self::target_worker_under_filter(policy, workers, info, &keep)
+                    {
+                        return decision;
+                    }
                     let subset: Vec<Arc<dyn Worker>> =
                         keep.iter().map(|&i| Arc::clone(&workers[i])).collect();
                     return self
@@ -280,6 +290,71 @@ impl PolicyRegistry {
             }
         }
         self.select_unfiltered(policy, workers, info)
+    }
+
+    /// Decide an `x-smg-target-worker` request against the *caller's* slice
+    /// when a candidate filter narrowed it to a strict subset.
+    ///
+    /// The header carries an index, and an index only means something
+    /// relative to the list it indexes. Passing the narrowed subset to a
+    /// policy that honors the header would make index `1` name a different
+    /// worker than the caller asked for — silently, and differently on every
+    /// request as the filter's verdict moves. So the registry answers it
+    /// here instead, and never re-bases the number.
+    ///
+    /// `Some(Some(idx))` when the named worker survived the filter and is
+    /// available; `Some(None)` when it did not, which the caller already
+    /// turns into the retryable 503. `None` means no target-worker decision
+    /// applies (this policy does not honor the header, or none was sent),
+    /// and the subset path continues.
+    ///
+    /// [`ConsistentHashingPolicy`] is the only policy that honors the header
+    /// today, and this mirrors its own rules: a value that is not an index
+    /// into the slice, or names an unavailable worker, refuses rather than
+    /// falling through to a different worker.
+    fn target_worker_under_filter(
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        keep: &[usize],
+    ) -> Option<Option<usize>> {
+        if !policy.as_any().is::<ConsistentHashingPolicy>() {
+            return None;
+        }
+        let raw = extract_target_worker(info.headers)?;
+        let Ok(idx) = raw.parse::<usize>() else {
+            debug!(
+                target_worker = raw,
+                "x-smg-target-worker is not a worker index; refusing the request"
+            );
+            return Some(None);
+        };
+        if idx >= workers.len() {
+            debug!(
+                target_worker = idx,
+                workers = workers.len(),
+                "x-smg-target-worker is out of range; refusing the request"
+            );
+            return Some(None);
+        }
+        if !keep.contains(&idx) {
+            debug!(
+                target_worker = idx,
+                worker = workers[idx].url(),
+                "x-smg-target-worker names a worker the candidate filter dropped \
+                 (paused, asleep, or too stale for the version policy); refusing the request"
+            );
+            return Some(None);
+        }
+        if !workers[idx].is_healthy_and_eligible() {
+            debug!(
+                target_worker = idx,
+                worker = workers[idx].url(),
+                "x-smg-target-worker names an unavailable worker; refusing the request"
+            );
+            return Some(None);
+        }
+        Some(Some(idx))
     }
 
     /// Today's selection: the sticky routing-key override when it applies,
@@ -2244,6 +2319,91 @@ mod tests {
             registry.select_worker(&policy, &workers, &SelectWorkerInfo::default()),
             None
         );
+    }
+
+    fn headers_with_target(idx: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-smg-target-worker", idx.parse().unwrap());
+        h
+    }
+
+    /// `x-smg-target-worker` indexes the caller's slice. Under a narrowed
+    /// candidate set the registry answers it itself, so the number always
+    /// names the worker the caller meant: a survivor is routed to at its own
+    /// index, and a dropped one refuses rather than resolving to whichever
+    /// worker happens to sit at that offset in the subset.
+    #[test]
+    fn target_worker_index_stays_in_the_callers_slice_under_a_filter() {
+        let registry = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        registry.set_candidate_filter(Arc::new(KeepIndices(Some(vec![0, 2]))));
+        let workers = three_workers();
+        let policy = registry.get_policy_or_default("m");
+        assert_eq!(policy.name(), "consistent_hashing");
+
+        for (target, expected, note) in [
+            (
+                "2",
+                Some(2),
+                "a survivor keeps the caller's index, not the subset's",
+            ),
+            ("0", Some(0), "the first survivor is unaffected"),
+            (
+                "1",
+                None,
+                "a filtered-out worker refuses instead of sliding to another",
+            ),
+            ("3", None, "out of range refuses"),
+            ("nope", None, "a non-index value refuses"),
+        ] {
+            let headers = headers_with_target(target);
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            assert_eq!(
+                registry.select_worker(&policy, &workers, &info),
+                expected,
+                "{note}"
+            );
+        }
+    }
+
+    /// With every candidate eligible there is no subset, so the policy reads
+    /// the header against the caller's slice exactly as it always has.
+    #[test]
+    fn target_worker_index_is_unchanged_when_the_filter_keeps_everything() {
+        let registry = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        registry.set_candidate_filter(Arc::new(KeepIndices(None)));
+        let workers = three_workers();
+        let policy = registry.get_policy_or_default("m");
+        let headers = headers_with_target("1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        assert_eq!(registry.select_worker(&policy, &workers, &info), Some(1));
+    }
+
+    /// Only a policy that honors the header gets this treatment. Round robin
+    /// ignores `x-smg-target-worker`, so it keeps selecting from the subset.
+    #[test]
+    fn a_policy_that_ignores_the_target_header_still_routes_within_the_subset() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_candidate_filter(Arc::new(KeepIndices(Some(vec![0, 2]))));
+        let workers = three_workers();
+        let policy = registry.get_policy_or_default("m");
+        let headers = headers_with_target("1");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        for _ in 0..4 {
+            let picked = registry.select_worker(&policy, &workers, &info);
+            assert!(
+                matches!(picked, Some(0) | Some(2)),
+                "round robin ignores the header and stays in the subset: {picked:?}"
+            );
+        }
     }
 
     #[test]
