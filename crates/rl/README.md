@@ -23,6 +23,14 @@ reported in `failed[]` as `unsupported_connection_mode` (HTTP 422 on the per-wor
 route), so a fan-out over a mixed fleet answers 207 and `smg.rl.RL.fanout` raises
 `FanoutError` unless `allow_partial=True`.
 
+Every error answers `{"error": <code>, "message": ...}` with a stable code:
+`invalid_body` (400, a malformed or absent JSON body), `invalid_version` (400,
+a `weight_version` that is empty, over 128 bytes, or not printable ASCII),
+`invalid_version_policy` (400), `invalid_engine_path` (400),
+`selector_required` / `invalid_selector` / `no_workers_match` (400),
+`worker_not_found` (404), `unsupported_connection_mode` (422),
+`upstream_unreachable` (502), and `upstream_timeout` (504).
+
 Flags: `--enable-rl`, `--rl-control-timeout-secs` (600), `--rl-fanout-concurrency` (32),
 `--rl-version-policy` (any).
 Recommended RL launch profile: `--enable-rl --disable-health-check --disable-circuit-breaker --request-timeout-secs 14400`.

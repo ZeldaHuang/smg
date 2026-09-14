@@ -120,10 +120,10 @@ class TestRlVersionRouting:
 
     def test_responses_are_stamped_and_follow_a_refit(self, setup_backend):
         _backend, model, _client, gateway = setup_backend
-        # Primary path: fan out update_weight_version. If the engine in the
-        # harness is an older SGLang that 404s on this RPC, fall back to
-        # update_weights_from_disk with model_path=model and
-        # weight_version="7" (mirrors examples/rl/refit_from_disk.py).
+        # Fans out update_weight_version. There is no fallback here: if the
+        # engine in the harness is an older SGLang that 404s on this RPC,
+        # switch this call to update_weights_from_disk with model_path=model
+        # and a weight_version field (mirrors examples/rl/refit_from_disk.py).
         resp = httpx.post(
             f"{gateway.base_url}/v1/rl/engine/update_weight_version",
             params={"selector": "engine=sglang"},

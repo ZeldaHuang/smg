@@ -138,6 +138,11 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
 /// [`preserve_response_headers`] so the gateway's value wins over anything an
 /// upstream set under the same name. Skipped if the URL isn't representable as
 /// a header value.
+///
+/// This is the header half of [`stamp_routed_worker`], which is what callers
+/// with a whole response in hand should use: it sets this header and the
+/// [`RoutedWorker`] extension together, and layers keyed on the extension
+/// (the RL version stamp among them) see nothing when only the header is set.
 pub fn insert_routed_worker_id(headers: &mut HeaderMap, worker_url: &str) {
     if let Ok(value) = HeaderValue::from_str(worker_url) {
         headers.insert(HEADER_ROUTED_WORKER_ID.clone(), value);
