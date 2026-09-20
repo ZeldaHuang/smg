@@ -143,3 +143,24 @@ been removed.
 Inactive scale-set values and deprecated `actions.summerwind.dev` resources are in
 [`archived/`](archived/README.md). They are retained only for historical recovery
 and must not be applied alongside the active runner scale sets.
+
+## CI node health monitor
+
+`.github/workflows/ci-node-health.yml` runs `scripts/ci_node_health.py` every hour on the
+`k8s-runner-cpu` scale set. It reads Prometheus (node-problem-detector, DCGM, node-exporter,
+kube-state-metrics) over the ClusterIP and the GitHub Actions API, and keeps **one GitHub
+issue per active problem** under the `ci-node-health` label. No kubeconfig and no secret
+beyond `GITHUB_TOKEN`.
+
+- Slack: `/github subscribe smg-project/smg issues label:"ci-node-health"` in the channel.
+  Only "opened" and "closed" reach Slack; body updates while a problem persists do not.
+- Acknowledge a known problem (for example a deliberate cordon) by assigning the issue to
+  yourself and leaving it open. It closes on its own two runs after the condition clears.
+- `GPU XID error` issues are never auto-closed. Close them after looking at the GPU.
+- Every run writes a fleet table (per-node ready, GPUs, NPD, disk, runner pods, 24 h XID and
+  OOM counts) and queue-wait percentiles to the run's job summary.
+- Dry run from a laptop:
+  `kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 19090:9090 &`
+  then `GITHUB_TOKEN=$(gh auth token) python3 scripts/ci_node_health.py --dry-run --repo smg-project/smg --prom-url http://127.0.0.1:19090`.
+- Checks, thresholds and the reasoning behind them:
+  `docs/superpowers/specs/2026-09-20-h100-ci-node-health-design.md`.
