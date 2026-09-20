@@ -305,6 +305,135 @@ def prom_findings(prom: Prom, nodes: set[str]) -> list[Finding]:
     return findings
 
 
+# --- GitHub ------------------------------------------------------------------
+
+
+class GitHubError(RuntimeError):
+    """The GitHub API was unreachable or returned an error."""
+
+
+class GitHub:
+    def __init__(self, repo: str, token: str | None, timeout: float = 30.0) -> None:
+        self.base = f"https://api.github.com/repos/{repo}"
+        self.token = token
+        self.timeout = timeout
+
+    def _request(self, method: str, path: str, params: dict | None, body: dict | None):
+        url = f"{self.base}/{path}"
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            raise GitHubError(f"{method} {path} -> {exc.code}: {exc.read()[:200]!r}") from exc
+        except (OSError, ValueError) as exc:
+            raise GitHubError(f"{method} {path} failed: {exc}") from exc
+
+    def get(self, path: str, params: dict | None = None):
+        return self._request("GET", path, params, None)
+
+    def post(self, path: str, body: dict):
+        return self._request("POST", path, None, body)
+
+    def patch(self, path: str, body: dict):
+        return self._request("PATCH", path, None, body)
+
+    def paginate(
+        self, path: str, key: str | None, params: dict | None = None, max_pages: int = 3
+    ) -> list:
+        items: list = []
+        base = dict(params or {}, per_page=100)
+        for page in range(1, max_pages + 1):
+            payload = self.get(path, dict(base, page=page))
+            batch = payload[key] if key else payload
+            items.extend(batch)
+            if len(batch) < 100:
+                break
+        return items
+
+
+def parse_ts(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+@dataclass
+class QueueStats:
+    waits_min: list[float] = field(default_factory=list)
+    queued_h100: int = 0
+    online_runners: dict[str, int] = field(default_factory=dict)
+
+
+def github_findings(gh: GitHub, now: datetime) -> tuple[list[Finding], QueueStats]:
+    findings: list[Finding] = []
+    stats = QueueStats()
+
+    since = (now - QUEUE_WINDOW).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for run in gh.paginate("actions/runs", "workflow_runs", {"created": f">={since}"}):
+        for job in gh.paginate(f"actions/runs/{run['id']}/jobs", "jobs", max_pages=2):
+            labels = [lab for lab in job.get("labels") or [] if lab in H100_LABELS]
+            if not labels:
+                continue
+            created = parse_ts(job["created_at"])
+            if job["status"] == "queued":
+                stats.queued_h100 += 1
+                age = now - created
+                if age >= STARVED_AFTER:
+                    minutes = age.total_seconds() / 60
+                    findings.append(
+                        Finding(
+                            CHECKS["runner_starved"],
+                            labels[0],
+                            f"{job['name']} queued {minutes:.0f} min ({job['html_url']})",
+                        )
+                    )
+            elif job.get("started_at"):
+                wait = parse_ts(job["started_at"]) - created
+                stats.waits_min.append(wait.total_seconds() / 60)
+
+    runners = gh.paginate("actions/runners", "runners")
+    for label in H100_LABELS:
+        online = sum(
+            1 for r in runners if r["name"].startswith(f"{label}-") and r["status"] == "online"
+        )
+        stats.online_runners[label] = online
+        if online == 0:
+            findings.append(Finding(CHECKS["runner_starved"], label, "no online runner registered"))
+
+    for run in gh.paginate("actions/runs", "workflow_runs", {"status": "queued"}, max_pages=2):
+        age = now - parse_ts(run["created_at"])
+        if age >= STALE_RUN_AFTER:
+            findings.append(
+                Finding(
+                    CHECKS["stale_queued_runs"],
+                    "github",
+                    f"{run['name']} run {run['id']} queued {age.days}d ({run['html_url']})",
+                )
+            )
+
+    if stats.waits_min:
+        p50 = statistics.median(stats.waits_min)
+        if p50 > QUEUE_WAIT_P50_MIN:
+            findings.append(
+                Finding(
+                    CHECKS["queue_wait"],
+                    "github",
+                    f"p50 {p50:.0f} min over {len(stats.waits_min)} jobs in the last 2h",
+                )
+            )
+    return findings, stats
+
+
 def main(argv: list[str] | None = None) -> int:
     raise SystemExit("main is implemented in Task 4")
 

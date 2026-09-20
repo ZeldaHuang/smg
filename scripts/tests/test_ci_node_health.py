@@ -127,3 +127,172 @@ def test_prom_query_raises_prom_error_on_failure(mod, monkeypatch):
     monkeypatch.setattr(mod.urllib.request, "urlopen", boom)
     with pytest.raises(mod.PromError):
         mod.Prom("http://127.0.0.1:1").query("up")
+
+
+# --- GitHub evaluators -------------------------------------------------------
+
+
+class FakeGitHub:
+    """Serves canned GET payloads keyed by path; records writes."""
+
+    def __init__(self, table: dict[str, object]):
+        self.table = table
+        self.writes: list[tuple[str, str, dict]] = []
+
+    def get(self, path: str, params: dict | None = None):
+        page = int((params or {}).get("page", 1))
+        payload = self.table.get(path, [])
+        if isinstance(payload, dict):
+            key = next(k for k in ("workflow_runs", "jobs", "runners") if k in payload)
+            items = payload[key] if page == 1 else []
+            return {key: items}
+        return payload if page == 1 else []
+
+    def paginate(self, path, key, params=None, max_pages=3):
+        payload = self.get(path, dict(params or {}, page=1))
+        return payload[key] if key else payload
+
+    def post(self, path, body):
+        self.writes.append(("POST", path, body))
+        return {"number": 999, "html_url": "https://github.com/x/y/issues/999"}
+
+    def patch(self, path, body):
+        self.writes.append(("PATCH", path, body))
+        return {}
+
+
+def _ts(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _job(name, label, created, started=None, status="completed", url="https://j"):
+    return {
+        "name": name,
+        "labels": [label],
+        "created_at": _ts(created),
+        "started_at": _ts(started) if started else None,
+        "status": status,
+        "html_url": url,
+    }
+
+
+def _runners(*names):
+    return {"runners": [{"name": n, "status": "online", "labels": []} for n in names]}
+
+
+ALL_ONLINE = _runners(
+    "1-gpu-h100-abc-runner-1", "2-gpu-h100-abc-runner-1", "4-gpu-h100-abc-runner-1"
+)
+
+
+def test_parse_ts_reads_github_timestamps(mod):
+    assert mod.parse_ts("2026-09-20T05:22:31Z") == datetime(2026, 9, 20, 5, 22, 31, tzinfo=UTC)
+
+
+def test_queue_wait_uses_job_created_to_started(mod):
+    gh = FakeGitHub(
+        {
+            "actions/runs": {
+                "workflow_runs": [{"id": 1, "name": "PR Test", "created_at": _ts(NOW)}]
+            },
+            "actions/runs/1/jobs": {
+                "jobs": [
+                    _job(
+                        "e2e-4gpu / run",
+                        "4-gpu-h100",
+                        NOW - timedelta(minutes=90),
+                        NOW - timedelta(minutes=20),
+                    ),
+                    _job(
+                        "e2e-1gpu / run",
+                        "1-gpu-h100",
+                        NOW - timedelta(minutes=60),
+                        NOW - timedelta(minutes=10),
+                    ),
+                    _job(
+                        "pre-commit",
+                        "k8s-runner-cpu",
+                        NOW - timedelta(minutes=60),
+                        NOW - timedelta(minutes=59),
+                    ),
+                ]
+            },
+            "actions/runners": ALL_ONLINE,
+        }
+    )
+    findings, stats = mod.github_findings(gh, NOW)
+    assert sorted(stats.waits_min) == [50.0, 70.0]  # the CPU job is not counted
+    assert [f.check.key for f in findings] == ["queue_wait"]
+    assert findings[0].detail.startswith("p50 60 min")
+
+
+def test_queued_h100_job_over_an_hour_is_starved(mod):
+    gh = FakeGitHub(
+        {
+            "actions/runs": {
+                "workflow_runs": [{"id": 1, "name": "PR Test", "created_at": _ts(NOW)}]
+            },
+            "actions/runs/1/jobs": {
+                "jobs": [
+                    _job(
+                        "e2e-4gpu / run",
+                        "4-gpu-h100",
+                        NOW - timedelta(minutes=75),
+                        status="queued",
+                    )
+                ]
+            },
+            "actions/runners": ALL_ONLINE,
+        }
+    )
+    findings, stats = mod.github_findings(gh, NOW)
+    assert stats.queued_h100 == 1
+    assert [(f.check.key, f.scope) for f in findings] == [("runner_starved", "4-gpu-h100")]
+    assert "queued 75 min" in findings[0].detail
+
+
+def test_label_with_no_online_runner_is_starved(mod):
+    gh = FakeGitHub(
+        {
+            "actions/runs": {"workflow_runs": []},
+            "actions/runners": _runners("1-gpu-h100-abc-runner-1", "4-gpu-h100-abc-runner-1"),
+        }
+    )
+    findings, stats = mod.github_findings(gh, NOW)
+    assert stats.online_runners == {"1-gpu-h100": 1, "2-gpu-h100": 0, "4-gpu-h100": 1}
+    assert [(f.check.key, f.scope, f.detail) for f in findings] == [
+        ("runner_starved", "2-gpu-h100", "no online runner registered")
+    ]
+
+
+def test_stale_queued_runs_older_than_a_day(mod):
+    old = NOW - timedelta(days=3)
+    fresh = NOW - timedelta(hours=2)
+    gh = FakeGitHub(
+        {
+            "actions/runs": {
+                "workflow_runs": [
+                    {
+                        "id": 5,
+                        "name": "Nightly tau2",
+                        "created_at": _ts(old),
+                        "html_url": "https://r/5",
+                    },
+                    {
+                        "id": 6,
+                        "name": "PR Test",
+                        "created_at": _ts(fresh),
+                        "html_url": "https://r/6",
+                    },
+                ]
+            },
+            "actions/runs/5/jobs": {"jobs": []},
+            "actions/runs/6/jobs": {"jobs": []},
+            "actions/runners": ALL_ONLINE,
+        }
+    )
+    findings, _ = mod.github_findings(gh, NOW)
+    stale = [f for f in findings if f.check.key == "stale_queued_runs"]
+    assert len(stale) == 1
+    assert stale[0].scope == "github"
+    assert "Nightly tau2 run 5 queued 3d" in stale[0].detail
