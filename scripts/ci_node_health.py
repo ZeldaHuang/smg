@@ -434,6 +434,223 @@ def github_findings(gh: GitHub, now: datetime) -> tuple[list[Finding], QueueStat
     return findings, stats
 
 
+# --- issue reconciliation ----------------------------------------------------
+
+
+@dataclass
+class IssueState:
+    number: int
+    key: str
+    first_seen: datetime
+    last_seen: datetime
+    last_comment: datetime | None
+    nodes: dict[str, datetime]
+
+
+@dataclass(frozen=True)
+class Op:
+    kind: str  # "create" | "update" | "comment" | "close"
+    number: int | None
+    key: str
+    title: str
+    body: str
+
+
+def parse_issue(issue: dict) -> IssueState | None:
+    body = issue.get("body") or ""
+    start = body.rfind(MARKER_PREFIX)
+    if start < 0:
+        return None
+    end = body.find(MARKER_SUFFIX, start)
+    if end < 0:
+        return None
+    try:
+        marker = json.loads(body[start + len(MARKER_PREFIX) : end])
+    except ValueError:
+        return None
+    try:
+        return IssueState(
+            number=int(issue["number"]),
+            key=marker["key"],
+            first_seen=datetime.fromisoformat(marker["first_seen"]),
+            last_seen=datetime.fromisoformat(marker["last_seen"]),
+            last_comment=(
+                datetime.fromisoformat(marker["last_comment"])
+                if marker.get("last_comment")
+                else None
+            ),
+            nodes={n: datetime.fromisoformat(t) for n, t in marker.get("nodes", {}).items()},
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def group_by_check(findings: list[Finding]) -> dict[str, list[Finding]]:
+    grouped: dict[str, list[Finding]] = {}
+    for f in findings:
+        grouped.setdefault(f.check.key, []).append(f)
+    return grouped
+
+
+def _scopes(findings: list[Finding]) -> list[str]:
+    return sorted({f.scope for f in findings})
+
+
+def render_title(check: Check, findings: list[Finding]) -> str:
+    return f"[node-health][{check.severity}] {check.title}: {', '.join(_scopes(findings))}"
+
+
+def _fmt(dt: datetime) -> str:
+    return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def render_body(
+    check: Check, findings: list[Finding], state: IssueState, now: datetime, run_url: str
+) -> str:
+    rows = "\n".join(
+        f"| {f.scope} | {f.detail} | {_fmt(state.nodes.get(f.scope, now))} |"
+        for f in sorted(findings, key=lambda f: (f.scope, f.detail))
+    )
+    marker = {
+        "key": check.key,
+        "first_seen": state.first_seen.isoformat(),
+        "last_seen": state.last_seen.isoformat(),
+        "last_comment": state.last_comment.isoformat() if state.last_comment else None,
+        "nodes": {n: t.isoformat() for n, t in state.nodes.items()},
+    }
+    lifecycle = (
+        "Closed by a human once the GPU is reset or the XID is confirmed benign."
+        if check.event
+        else "Closed automatically once the condition has been clear for two consecutive runs."
+    )
+    return (
+        f"**H100 CI node health** · {check.severity} · {check.title}\n\n"
+        f"{check.meaning}\n\n"
+        f"| Scope | Detail | First seen |\n|---|---|---|\n{rows}\n\n"
+        f"**First action:** {check.first_action}\n\n"
+        f"{lifecycle}\n\n"
+        f"Last checked {_fmt(now)} · [monitor run]({run_url}) · [spec]({SPEC})\n\n"
+        f"{MARKER_PREFIX}{json.dumps(marker, sort_keys=True)}{MARKER_SUFFIX}\n"
+    )
+
+
+def plan_ops(
+    open_states: list[IssueState],
+    active: dict[str, list[Finding]],
+    now: datetime,
+    run_url: str,
+) -> list[Op]:
+    ops: list[Op] = []
+    by_key = {s.key: s for s in open_states}
+
+    for key, findings in active.items():
+        check = CHECKS[key]
+        state = by_key.get(key)
+        if state is None:
+            nodes = {scope: now for scope in _scopes(findings)}
+            fresh = IssueState(0, key, now, now, now if check.event else None, nodes)
+            ops.append(
+                Op(
+                    "create",
+                    None,
+                    key,
+                    render_title(check, findings),
+                    render_body(check, findings, fresh, now, run_url),
+                )
+            )
+            continue
+        state.last_seen = now
+        state.nodes = {scope: state.nodes.get(scope, now) for scope in _scopes(findings)}
+        comment = check.event and (
+            state.last_comment is None or now - state.last_comment >= COMMENT_EVERY
+        )
+        if comment:
+            state.last_comment = now
+        ops.append(
+            Op(
+                "update",
+                state.number,
+                key,
+                render_title(check, findings),
+                render_body(check, findings, state, now, run_url),
+            )
+        )
+        if comment:
+            lines = "\n".join(f"- {f.scope}: {f.detail}" for f in findings)
+            ops.append(
+                Op(
+                    "comment",
+                    state.number,
+                    key,
+                    "",
+                    f"Still firing at {_fmt(now)} ([run]({run_url})):\n{lines}",
+                )
+            )
+
+    for state in open_states:
+        check = CHECKS.get(state.key)
+        if state.key in active or check is None or check.event:
+            continue
+        if now - state.last_seen >= CLOSE_AFTER:
+            body = (
+                f"Resolved: clear for two consecutive runs as of {_fmt(now)} "
+                f"([run]({run_url})).\n\n"
+                f"{MARKER_PREFIX}{json.dumps({'key': state.key, 'closed': now.isoformat()})}"
+                f"{MARKER_SUFFIX}\n"
+            )
+            ops.append(Op("close", state.number, state.key, "", body))
+    return ops
+
+
+def apply_ops(gh: GitHub, ops: list[Op], dry_run: bool) -> None:
+    for op in ops:
+        label = f"{op.kind} #{op.number}" if op.number else op.kind
+        mode = "dry-run" if dry_run else "apply"
+        print(f"[{mode}] {label} {op.key}: {op.title or op.body[:80]!r}")
+        if dry_run:
+            continue
+        if op.kind == "create":
+            gh.post("issues", {"title": op.title, "body": op.body, "labels": [ISSUE_LABEL]})
+        elif op.kind == "update":
+            gh.patch(f"issues/{op.number}", {"title": op.title, "body": op.body})
+        elif op.kind == "comment":
+            gh.post(f"issues/{op.number}/comments", {"body": op.body})
+        elif op.kind == "close":
+            gh.patch(
+                f"issues/{op.number}",
+                {"body": op.body, "state": "closed", "state_reason": "completed"},
+            )
+
+
+def ensure_label(gh: GitHub, dry_run: bool) -> None:
+    if dry_run:
+        return
+    try:
+        gh.post(
+            "labels",
+            {
+                "name": ISSUE_LABEL,
+                "color": "d93f0b",
+                "description": "Automated H100 CI node health findings",
+            },
+        )
+    except GitHubError as exc:
+        if "422" not in str(exc):  # 422 = already exists
+            raise
+
+
+def open_issue_states(gh: GitHub) -> list[IssueState]:
+    issues = gh.paginate("issues", None, {"labels": ISSUE_LABEL, "state": "open"})
+    states = []
+    for issue in issues:
+        if "pull_request" in issue:
+            continue
+        state = parse_issue(issue)
+        if state is not None:
+            states.append(state)
+    return states
+
+
 def main(argv: list[str] | None = None) -> int:
     raise SystemExit("main is implemented in Task 4")
 

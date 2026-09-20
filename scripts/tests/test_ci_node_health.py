@@ -7,6 +7,7 @@ fakes that return canned API payloads.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -296,3 +297,177 @@ def test_stale_queued_runs_older_than_a_day(mod):
     assert len(stale) == 1
     assert stale[0].scope == "github"
     assert "Nightly tau2 run 5 queued 3d" in stale[0].detail
+
+
+# --- issue reconciliation ----------------------------------------------------
+
+
+def _finding(mod, key, scope, detail="d"):
+    return mod.Finding(mod.CHECKS[key], scope, detail)
+
+
+def _issue(mod, number, key, first_seen, last_seen, last_comment=None, nodes=None):
+    marker = {
+        "key": key,
+        "first_seen": first_seen.isoformat(),
+        "last_seen": last_seen.isoformat(),
+        "last_comment": last_comment.isoformat() if last_comment else None,
+        "nodes": {n: first_seen.isoformat() for n in (nodes or [])},
+    }
+    return {
+        "number": number,
+        "body": f"old body\n\n{mod.MARKER_PREFIX}{json.dumps(marker)}{mod.MARKER_SUFFIX}",
+        "title": "old title",
+    }
+
+
+def test_parse_issue_reads_marker_and_ignores_foreign_issues(mod):
+    issue = _issue(
+        mod,
+        7,
+        "node_cordoned",
+        NOW - timedelta(hours=3),
+        NOW - timedelta(hours=1),
+        nodes=["10.0.98.28"],
+    )
+    state = mod.parse_issue(issue)
+    assert state and state.number == 7 and state.key == "node_cordoned"
+    assert state.nodes == {"10.0.98.28": NOW - timedelta(hours=3)}
+    assert mod.parse_issue({"number": 8, "body": "a human wrote this", "title": "x"}) is None
+
+
+def test_body_round_trips_through_marker(mod):
+    check = mod.CHECKS["node_cordoned"]
+    findings = [_finding(mod, "node_cordoned", "10.0.98.28", "unschedulable for over 2h")]
+    state = mod.IssueState(0, "node_cordoned", NOW, NOW, None, {"10.0.98.28": NOW})
+    body = mod.render_body(check, findings, state, NOW, "https://run/1")
+    assert check.meaning in body and check.first_action in body
+    assert "| 10.0.98.28 | unschedulable for over 2h |" in body
+    assert "https://run/1" in body
+    parsed = mod.parse_issue({"number": 1, "body": body, "title": ""})
+    assert parsed and parsed.nodes == {"10.0.98.28": NOW}
+
+
+def test_render_title_lists_scopes(mod):
+    check = mod.CHECKS["gpu_xid"]
+    fs = [
+        _finding(mod, "gpu_xid", "10.0.1.2"),
+        _finding(mod, "gpu_xid", "10.0.1.1"),
+        _finding(mod, "gpu_xid", "10.0.1.2"),
+    ]
+    assert mod.render_title(check, fs) == "[node-health][CRIT] GPU XID error: 10.0.1.1, 10.0.1.2"
+
+
+def test_plan_ops_creates_issue_for_new_finding(mod):
+    active = mod.group_by_check([_finding(mod, "node_cordoned", "10.0.98.28")])
+    ops = mod.plan_ops([], active, NOW, "https://run/1")
+    assert [(o.kind, o.key) for o in ops] == [("create", "node_cordoned")]
+    assert ops[0].title.startswith("[node-health][WARN] H100 node cordoned: 10.0.98.28")
+    assert mod.MARKER_PREFIX in ops[0].body
+
+
+def test_plan_ops_updates_open_issue_without_comment(mod):
+    first = NOW - timedelta(hours=5)
+    state = mod.parse_issue(
+        _issue(mod, 7, "node_cordoned", first, NOW - timedelta(hours=1), nodes=["10.0.98.28"])
+    )
+    active = mod.group_by_check(
+        [
+            _finding(mod, "node_cordoned", "10.0.98.28"),
+            _finding(mod, "node_cordoned", "10.0.69.208"),
+        ]
+    )
+    ops = mod.plan_ops([state], active, NOW, "https://run/2")
+    assert [(o.kind, o.number) for o in ops] == [("update", 7)]
+    parsed = mod.parse_issue({"number": 7, "body": ops[0].body, "title": ""})
+    assert parsed.first_seen == first  # first_seen survives updates
+    assert parsed.last_seen == NOW
+    assert parsed.nodes["10.0.98.28"] == first  # existing node keeps its first-seen
+    assert parsed.nodes["10.0.69.208"] == NOW  # new node gets now
+
+
+def test_plan_ops_closes_state_finding_only_after_two_missed_runs(mod):
+    recent = mod.parse_issue(
+        _issue(mod, 1, "node_cordoned", NOW - timedelta(hours=4), NOW - timedelta(minutes=60))
+    )
+    old = mod.parse_issue(
+        _issue(mod, 2, "disk_full", NOW - timedelta(hours=4), NOW - timedelta(minutes=95))
+    )
+    ops = mod.plan_ops([recent, old], {}, NOW, "https://run/3")
+    assert [(o.kind, o.number) for o in ops] == [("close", 2)]
+
+
+def test_plan_ops_never_closes_event_findings(mod):
+    xid = mod.parse_issue(
+        _issue(mod, 3, "gpu_xid", NOW - timedelta(days=2), NOW - timedelta(days=2))
+    )
+    assert mod.plan_ops([xid], {}, NOW, "https://run/4") == []
+
+
+def test_plan_ops_comments_on_event_at_most_daily(mod):
+    fresh = mod.parse_issue(
+        _issue(
+            mod,
+            3,
+            "gpu_xid",
+            NOW - timedelta(hours=2),
+            NOW - timedelta(hours=1),
+            last_comment=NOW - timedelta(hours=2),
+        )
+    )
+    stale = mod.parse_issue(
+        _issue(
+            mod,
+            4,
+            "gpu_xid",
+            NOW - timedelta(days=2),
+            NOW - timedelta(days=1),
+            last_comment=NOW - timedelta(days=2),
+        )
+    )
+    active = mod.group_by_check(
+        [_finding(mod, "gpu_xid", "10.0.1.1", "gpu0: 1 XID change(s) in the last hour")]
+    )
+    ops_fresh = mod.plan_ops([fresh], active, NOW, "https://run/5")
+    assert [o.kind for o in ops_fresh] == ["update"]
+    ops_stale = mod.plan_ops([stale], active, NOW, "https://run/5")
+    assert [o.kind for o in ops_stale] == ["update", "comment"]
+    assert "gpu0: 1 XID change(s)" in ops_stale[1].body
+    parsed = mod.parse_issue({"number": 4, "body": ops_stale[0].body, "title": ""})
+    assert parsed.last_comment == NOW
+
+
+def test_plan_ops_ignores_issues_with_unknown_keys(mod):
+    weird = mod.parse_issue(
+        _issue(mod, 9, "retired_check", NOW - timedelta(days=9), NOW - timedelta(days=9))
+    )
+    assert mod.plan_ops([weird], {}, NOW, "https://run/6") == []
+
+
+def test_apply_ops_dry_run_writes_nothing(mod, capsys):
+    gh = FakeGitHub({})
+    ops = [
+        mod.Op("create", None, "node_cordoned", "t", "b"),
+        mod.Op("close", 5, "disk_full", "", "b"),
+    ]
+    mod.apply_ops(gh, ops, dry_run=True)
+    assert gh.writes == []
+    out = capsys.readouterr().out
+    assert "create" in out and "close #5" in out
+
+
+def test_apply_ops_performs_writes(mod):
+    gh = FakeGitHub({})
+    ops = [
+        mod.Op("create", None, "node_cordoned", "t", "b"),
+        mod.Op("update", 7, "node_cordoned", "t2", "b2"),
+        mod.Op("comment", 7, "gpu_xid", "", "c"),
+        mod.Op("close", 5, "disk_full", "", "b5"),
+    ]
+    mod.apply_ops(gh, ops, dry_run=False)
+    assert gh.writes == [
+        ("POST", "issues", {"title": "t", "body": "b", "labels": [mod.ISSUE_LABEL]}),
+        ("PATCH", "issues/7", {"title": "t2", "body": "b2"}),
+        ("POST", "issues/7/comments", {"body": "c"}),
+        ("PATCH", "issues/5", {"body": "b5", "state": "closed", "state_reason": "completed"}),
+    ]
