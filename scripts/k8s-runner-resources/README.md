@@ -189,8 +189,10 @@ One issue per check, never per node; the issue body lists the affected nodes.
   which the Slack app does not relay.
 - A state finding closes only after it has been absent for two consecutive runs. Checks that
   were not evaluated (Prometheus down) are never closed.
-- Event findings (XID) never auto-close and get at most one comment per 24 h. An XID issue a
-  human closed is not recreated within the hour the lookback still sees the same event.
+- Event findings (XID) never auto-close and get at most one comment per 24 h. After a human
+  closes an XID issue, the same nodes are not re-reported for the hour the lookback still sees
+  the event; an XID on another node opens a new issue immediately.
 - Kernel OOM kills appear in the job summary only: container-limit OOMs match too.
-- The GitHub side stays under about 80 API requests per run (one page of recent runs, capped
-  at 40 for wait statistics, plus the queued and in-progress runs for starvation).
+- The GitHub side reads one page of recent runs (capped at 40 for wait statistics) plus one
+  page each of queued and in-progress runs for starvation, with one jobs page per run: normally
+  well under 80 API requests per run, about 245 in the worst case.

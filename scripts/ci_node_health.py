@@ -2,9 +2,9 @@
 """Hourly health monitor for the H100 CI nodes.
 
 Reads Prometheus (node-problem-detector, DCGM, node-exporter, kube-state-metrics)
-and the GitHub Actions API, evaluates the checks from
-docs/superpowers/specs/2026-09-20-h100-ci-node-health-design.md, and keeps one
-GitHub issue per active check under the ``ci-node-health`` label. Slack is fed by
+and the GitHub Actions API, evaluates the checks documented in
+scripts/k8s-runner-resources/README.md (section "CI node health monitor"), and
+keeps one GitHub issue per active check under the ``ci-node-health`` label. Slack is fed by
 the GitHub Slack app subscribed to that label, so the only notifications are
 "issue opened" and "issue closed".
 
@@ -419,8 +419,9 @@ def github_findings(gh: GitHub, now: datetime) -> tuple[list[Finding], QueueStat
     Request budget per run: one runs listing plus at most MAX_RECENT_RUNS jobs
     requests for the wait statistics, then two run listings (queued and
     in-progress) with one jobs request each for the starvation check. Every
-    listing reads a single page, so a busy hour costs roughly 80 requests out
-    of the 1,000 per hour GITHUB_TOKEN gets for the repository.
+    listing reads a single page of 100, so the strict worst case is about 245
+    requests (1 + 40 + 2 + 200) and a normal hour costs well under 80, out of
+    the 1,000 per hour GITHUB_TOKEN gets for the repository.
     """
     findings: list[Finding] = []
     stats = QueueStats()
@@ -435,19 +436,25 @@ def github_findings(gh: GitHub, now: datetime) -> tuple[list[Finding], QueueStat
     stats.sampled_runs = len(recent)
     for run in recent:
         for job in _jobs(gh, run):
+            if job.get("conclusion") == "skipped":
+                continue  # never waited for a runner; would dilute the median
             if _h100_labels(job) and job.get("started_at") and job.get("created_at"):
                 wait = parse_ts(job["started_at"]) - parse_ts(job["created_at"])
                 stats.waits_min.append(wait.total_seconds() / 60)
 
     # Starvation: H100 jobs still queued in any unfinished run, however old
     # the run is. Runs queued for over a day are reported as stale instead.
+    # The two listings are sequential snapshots: a run that starts between
+    # them appears in both, and the in-progress record wins.
     queued_runs = gh.paginate("actions/runs", "workflow_runs", {"status": "queued"}, max_pages=1)
     in_progress = gh.paginate(
         "actions/runs", "workflow_runs", {"status": "in_progress"}, max_pages=1
     )
-    stale = [r for r in queued_runs if now - parse_ts(r["created_at"]) >= STALE_RUN_AFTER]
+    in_progress_ids = {r["id"] for r in in_progress}
+    queued_only = [r for r in queued_runs if r["id"] not in in_progress_ids]
+    stale = [r for r in queued_only if now - parse_ts(r["created_at"]) >= STALE_RUN_AFTER]
     stale_ids = {r["id"] for r in stale}
-    active_runs = [r for r in queued_runs + in_progress if r["id"] not in stale_ids]
+    active_runs = [r for r in queued_only if r["id"] not in stale_ids] + in_progress
     stats.active_runs = len(active_runs)
     for run in active_runs:
         for job in _jobs(gh, run):
@@ -629,15 +636,16 @@ def plan_ops(
     run_url: str,
     docs_url: str = "",
     evaluated: set[str] | None = None,
-    recently_closed: dict[str, datetime] | None = None,
+    recently_closed: dict[str, dict[str, datetime]] | None = None,
 ) -> list[Op]:
     """Diff active findings against open issues and return the issue operations.
 
     ``evaluated`` lists the check keys that actually ran this time; issues for
     other keys are left alone rather than closed (a Prometheus outage must not
-    "resolve" a disk-full issue). ``recently_closed`` maps check keys to the
-    time a human closed the issue; an event check inside EVENT_REOPEN_GRACE is
-    not recreated, since its lookback still sees the same event.
+    "resolve" a disk-full issue). ``recently_closed`` maps a check key to the
+    scopes of its closed issues and when each was closed; an event finding for
+    a scope closed less than EVENT_REOPEN_GRACE ago is not recreated, since the
+    lookback still sees the same event. A new scope always opens an issue.
     """
     ops: list[Op] = []
     by_key = {s.key: s for s in open_states}
@@ -647,9 +655,15 @@ def plan_ops(
         check = CHECKS[key]
         state = by_key.get(key)
         if state is None:
-            closed_at = recently_closed.get(key)
-            if check.event and closed_at is not None and now - closed_at < EVENT_REOPEN_GRACE:
-                continue
+            if check.event:
+                closed = recently_closed.get(key, {})
+                findings = [
+                    f
+                    for f in findings
+                    if f.scope not in closed or now - closed[f.scope] >= EVENT_REOPEN_GRACE
+                ]
+                if not findings:
+                    continue
             nodes = {scope: now for scope in _scopes(findings)}
             fresh = IssueState(0, key, now, now, now if check.event else None, nodes)
             ops.append(
@@ -746,8 +760,8 @@ def ensure_label(gh: GitHub, dry_run: bool) -> None:
             raise
 
 
-def issue_states(gh: GitHub) -> tuple[list[IssueState], dict[str, datetime]]:
-    """Open monitor issues as state, plus the latest close time per check key."""
+def issue_states(gh: GitHub) -> tuple[list[IssueState], dict[str, dict[str, datetime]]]:
+    """Open monitor issues as state, plus the latest close time per check key and scope."""
     open_states = []
     for issue in gh.paginate("issues", None, {"labels": ISSUE_LABEL, "state": "open"}):
         if "pull_request" in issue:
@@ -755,7 +769,7 @@ def issue_states(gh: GitHub) -> tuple[list[IssueState], dict[str, datetime]]:
         state = parse_issue(issue)
         if state is not None:
             open_states.append(state)
-    recently_closed: dict[str, datetime] = {}
+    recently_closed: dict[str, dict[str, datetime]] = {}
     closed = gh.paginate(
         "issues",
         None,
@@ -763,12 +777,15 @@ def issue_states(gh: GitHub) -> tuple[list[IssueState], dict[str, datetime]]:
         max_pages=1,
     )
     for issue in closed:
-        key = issue_key(issue)
-        if key is None or not issue.get("closed_at"):
+        marker = _marker(issue.get("body"))
+        key = marker.get("key") if marker else None
+        if not isinstance(key, str) or not issue.get("closed_at"):
             continue
         closed_at = parse_ts(issue["closed_at"])
-        if key not in recently_closed or closed_at > recently_closed[key]:
-            recently_closed[key] = closed_at
+        per_scope = recently_closed.setdefault(key, {})
+        for scope in marker.get("nodes", {}):
+            if scope not in per_scope or closed_at > per_scope[scope]:
+                per_scope[scope] = closed_at
     return open_states, recently_closed
 
 

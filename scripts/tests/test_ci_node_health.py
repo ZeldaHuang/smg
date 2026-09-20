@@ -241,6 +241,25 @@ def test_queue_wait_uses_job_created_to_started(mod):
     assert findings[0].detail.startswith("p50 60 min")
 
 
+def test_skipped_jobs_do_not_dilute_queue_wait(mod):
+    skipped = _job("e2e-4gpu / run", "4-gpu-h100", NOW, NOW)
+    skipped["conclusion"] = "skipped"
+    gh = FakeGitHub(
+        {
+            "actions/runs": {"workflow_runs": [_run(1, NOW)]},
+            "actions/runs/1/jobs": {
+                "jobs": [
+                    skipped,
+                    _job("e2e-1gpu / run", "1-gpu-h100", NOW - timedelta(minutes=60), NOW),
+                ]
+            },
+            **NO_ACTIVE_RUNS,
+        }
+    )
+    _, stats = mod.github_findings(gh, NOW)
+    assert stats.waits_min == [60.0]
+
+
 def test_queued_h100_job_in_old_in_progress_run_is_starved(mod):
     # The run started 5h ago (outside the 2h wait-statistics window) and one
     # H100 job has been queued for 3h: the starvation check must still see it.
@@ -266,6 +285,27 @@ def test_queued_h100_job_in_old_in_progress_run_is_starved(mod):
     assert stats.active_runs == 1
     assert [(f.check.key, f.scope) for f in findings] == [("runner_starved", "4-gpu-h100")]
     assert "queued 180 min" in findings[0].detail
+
+
+def test_run_in_both_snapshots_is_scanned_once_as_in_progress(mod):
+    # A run that moves from queued to in_progress between the two listings
+    # shows up in both. It must be scanned once, and its age must not make it
+    # a stale queued run.
+    old = NOW - timedelta(days=2)
+    both = _run(7, old)
+    gh = FakeGitHub(
+        {
+            "actions/runs": {"workflow_runs": []},
+            "actions/runs?status=queued": {"workflow_runs": [both]},
+            "actions/runs?status=in_progress": {"workflow_runs": [both]},
+            "actions/runs/7/jobs": {
+                "jobs": [_job("e2e / run", "4-gpu-h100", NOW - timedelta(hours=2), status="queued")]
+            },
+        }
+    )
+    findings, stats = mod.github_findings(gh, NOW)
+    assert stats.active_runs == 1 and stats.queued_h100 == 1
+    assert [f.check.key for f in findings] == ["runner_starved"]
 
 
 def test_github_findings_never_calls_the_runners_endpoint(mod):
@@ -466,16 +506,29 @@ def test_plan_ops_leaves_unevaluated_checks_open(mod):
 
 def test_plan_ops_does_not_recreate_event_issue_closed_within_grace(mod):
     active = mod.group_by_check([_finding(mod, "gpu_xid", "10.0.1.1")])
-    just_closed = {"gpu_xid": NOW - timedelta(minutes=20)}
+    just_closed = {"gpu_xid": {"10.0.1.1": NOW - timedelta(minutes=20)}}
     assert mod.plan_ops([], active, NOW, "https://run/8", recently_closed=just_closed) == []
-    long_ago = {"gpu_xid": NOW - timedelta(hours=2)}
+    long_ago = {"gpu_xid": {"10.0.1.1": NOW - timedelta(hours=2)}}
     ops = mod.plan_ops([], active, NOW, "https://run/8", recently_closed=long_ago)
     assert [o.kind for o in ops] == ["create"]
     # state checks are never suppressed by a recent close
     cordon = mod.group_by_check([_finding(mod, "node_cordoned", "10.0.1.1")])
-    closed = {"node_cordoned": NOW - timedelta(minutes=20)}
+    closed = {"node_cordoned": {"10.0.1.1": NOW - timedelta(minutes=20)}}
     ops = mod.plan_ops([], cordon, NOW, "https://run/8", recently_closed=closed)
     assert [o.kind for o in ops] == ["create"]
+
+
+def test_plan_ops_recreates_event_issue_for_a_new_scope_during_grace(mod):
+    # 10.0.1.1's XID issue was closed 20 minutes ago; a fresh XID on 10.0.1.2
+    # must still open an issue, listing only the new node.
+    active = mod.group_by_check(
+        [_finding(mod, "gpu_xid", "10.0.1.1"), _finding(mod, "gpu_xid", "10.0.1.2")]
+    )
+    closed = {"gpu_xid": {"10.0.1.1": NOW - timedelta(minutes=20)}}
+    ops = mod.plan_ops([], active, NOW, "https://run/9", recently_closed=closed)
+    assert [(o.kind, o.title) for o in ops] == [
+        ("create", "[node-health][CRIT] GPU XID error: 10.0.1.2")
+    ]
 
 
 def test_render_body_links_docs_when_given(mod):
@@ -488,7 +541,16 @@ def test_render_body_links_docs_when_given(mod):
 
 def test_issue_states_reads_open_state_and_latest_close_per_key(mod):
     open_issue = _issue(mod, 1, "node_cordoned", NOW - timedelta(hours=3), NOW - timedelta(hours=1))
-    closed_new = dict(_issue(mod, 2, "gpu_xid", NOW - timedelta(days=1), NOW - timedelta(days=1)))
+    closed_new = dict(
+        _issue(
+            mod,
+            2,
+            "gpu_xid",
+            NOW - timedelta(days=1),
+            NOW - timedelta(days=1),
+            nodes=["10.0.1.1", "10.0.1.2"],
+        )
+    )
     closed_new["closed_at"] = _ts(NOW - timedelta(minutes=30))
     auto_closed_marker = json.dumps({"key": "gpu_xid", "closed": "x"})
     closed_old = {
@@ -502,7 +564,8 @@ def test_issue_states_reads_open_state_and_latest_close_per_key(mod):
     )
     states, recently_closed = mod.issue_states(gh)
     assert [s.number for s in states] == [1]
-    assert recently_closed == {"gpu_xid": NOW - timedelta(minutes=30)}
+    closed_at = NOW - timedelta(minutes=30)
+    assert recently_closed == {"gpu_xid": {"10.0.1.1": closed_at, "10.0.1.2": closed_at}}
 
 
 def test_apply_ops_dry_run_writes_nothing(mod, capsys):
