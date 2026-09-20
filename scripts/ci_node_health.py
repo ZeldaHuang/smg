@@ -276,10 +276,18 @@ PROM_CHECKS: tuple[PromCheck, ...] = (
         '(avg_over_time(kube_node_status_condition{status="unknown"}[6h])) > 0.5',
         lambda m, v: f"{m['condition']} Unknown {v * 100:.0f}% of the last 6h",
     ),
+    # A subquery, not min_over_time: when a GPU gets attributed to a pod, its
+    # pod="" series goes stale but its old samples stay inside a [30m] range
+    # vector, so min_over_time flagged GPUs that a new job had just picked up.
+    # Counting one-minute steps only sees the GPU while it is unattributed.
     PromCheck(
         CHECKS["gpu_mem_leak"],
-        'max by (Hostname, gpu) (min_over_time(DCGM_FI_DEV_FB_USED{pod=""}[30m])) > 2048',
-        lambda m, v: f"gpu{m['gpu']}: {v / 1024:.1f} GiB used with no pod for 30m",
+        'count_over_time((max by (Hostname, gpu) (DCGM_FI_DEV_FB_USED{pod=""}) > 2048)'
+        "[30m:1m]) >= 28",
+        lambda m, v: (
+            f"gpu{m['gpu']}: over 2 GiB used with no pod at {int(v)} of the last 30 "
+            "one-minute checks"
+        ),
     ),
     PromCheck(
         CHECKS["gpu_hot"],
