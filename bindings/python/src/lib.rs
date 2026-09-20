@@ -12,6 +12,9 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 use smg::*;
 use smg_auth as auth;
 
+mod worker_control;
+use worker_control::{init_tracing, PyWorkerControlServer};
+
 // Define the enums with PyO3 bindings
 #[pyclass(eq, from_py_object)]
 #[derive(Clone, PartialEq, Debug)]
@@ -37,6 +40,8 @@ pub enum BackendType {
     /// vLLM engine. Routing behaves like the default; over ZMQ this pins the
     /// startup workers' wire protocol to vLLM EngineCore.
     Vllm,
+    /// TensorRT-LLM engine behind an SMG Worker data plane.
+    Trtllm,
     /// TokenSpeed engine. Routing behaves like the default; over ZMQ this pins
     /// the startup workers' wire protocol to TokenSpeed.
     Tokenspeed,
@@ -534,6 +539,7 @@ struct Router {
     enable_rl: bool,
     rl_control_timeout_secs: u64,
     rl_fanout_concurrency: usize,
+    worker_mode: worker::WorkerMode,
 }
 
 impl Router {
@@ -816,21 +822,20 @@ impl Router {
             None
         };
 
-        // `backend` normally only steers the routing mode. Over ZMQ it
-        // additionally pins the startup workers' runtime: the shared EngineCore
-        // handshake carries no engine identity, so the wire protocol cannot be
-        // probed. HTTP/gRPC keep auto-detection (None). Mirrors
-        // `to_router_config` in model_gateway/src/main.rs.
-        let startup_worker_runtime_type =
-            if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
-                match self.backend {
-                    BackendType::Vllm => Some(worker::RuntimeType::Vllm),
-                    BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+        // `backend` steers the routing mode; `startup_worker_runtime_type`
+        // decides whether it also pins the startup workers' runtime.
+        let backend_runtime = match self.backend {
+            BackendType::Sglang => Some(worker::RuntimeType::Sglang),
+            BackendType::Vllm => Some(worker::RuntimeType::Vllm),
+            BackendType::Trtllm => Some(worker::RuntimeType::Trtllm),
+            BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
+            BackendType::Openai | BackendType::Anthropic => None,
+        };
+        let startup_worker_runtime_type = config::startup_worker_runtime_type(
+            self.worker_mode,
+            self.connection_mode,
+            backend_runtime,
+        );
 
         config::RouterConfig::builder()
             .mode(mode)
@@ -841,6 +846,7 @@ impl Router {
             .health_check_port(self.health_check_port)
             .connection_mode(self.connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
+            .startup_worker_mode(self.worker_mode)
             .zmq_engine_count(self.zmq_engine_count)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
@@ -1117,12 +1123,9 @@ impl Router {
         enable_rl = false,
         rl_control_timeout_secs = 600,
         rl_fanout_concurrency = 32,
+        worker_mode = String::from("engine"),
     ))]
     #[expect(clippy::too_many_arguments)]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "PyO3 #[new] method signature requires PyResult"
-    )]
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
@@ -1276,6 +1279,7 @@ impl Router {
         enable_rl: bool,
         rl_control_timeout_secs: u64,
         rl_fanout_concurrency: usize,
+        worker_mode: String,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1296,6 +1300,9 @@ impl Router {
         }
 
         let connection_mode = Self::determine_connection_mode(&all_urls);
+        let worker_mode = worker_mode
+            .parse::<worker::WorkerMode>()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
         Ok(Router {
             host,
@@ -1447,6 +1454,7 @@ impl Router {
             enable_rl,
             rl_control_timeout_secs,
             rl_fanout_concurrency,
+            worker_mode,
         })
     }
 
@@ -1644,10 +1652,12 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPostgresConfig>()?;
     m.add_class::<PyRedisConfig>()?;
     m.add_class::<Router>()?;
+    m.add_class::<PyWorkerControlServer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_tool_call_parsers, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_reasoning_parsers, m)?)?;
+    m.add_function(wrap_pyfunction!(init_tracing, m)?)?;
     Ok(())
 }

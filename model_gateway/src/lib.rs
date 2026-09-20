@@ -15,4 +15,5 @@ pub mod tenant;
 pub mod version;
 pub mod wasm;
 pub mod worker;
+pub mod worker_node;
 pub mod workflow;
