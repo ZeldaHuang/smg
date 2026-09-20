@@ -162,5 +162,35 @@ beyond `GITHUB_TOKEN`.
 - Dry run from a laptop:
   `kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 19090:9090 &`
   then `GITHUB_TOKEN=$(gh auth token) python3 scripts/ci_node_health.py --dry-run --repo smg-project/smg --prom-url http://127.0.0.1:19090`.
-- Checks, thresholds and the reasoning behind them:
-  `docs/superpowers/specs/2026-09-20-h100-ci-node-health-design.md`.
+
+### Checks
+
+One issue per check, never per node; the issue body lists the affected nodes.
+
+| Sev | Check | Fires when |
+|---|---|---|
+| CRIT | H100 node not Ready | `Ready` condition is not `True` |
+| CRIT | NPD hardware condition | any of `GpuEcc`, `GpuRowRemap`, `GpuBus`, `GpuCount`, `RdmaLink`, `RdmaLinkFlapping`, `RdmaWpaAuth`, `RdmaRttcc`, `KernelDeadlock`, `ReadonlyFilesystem` is `True` (node-problem-detector never cordons on its own) |
+| CRIT | GPU XID error | `DCGM_FI_DEV_XID_ERRORS` changed in the last hour (closed by a human) |
+| CRIT | GPU row-remap failure | `DCGM_FI_DEV_ROW_REMAP_FAILURE > 0` |
+| CRIT | Node disk over 85% | root (runner emptyDirs, dind) or `/raid` (model cache) |
+| CRIT | GPU runner label starved | an H100 job queued over 60 min in any unfinished run |
+| CRIT | Monitor cannot reach Prometheus | the node checks were skipped this run |
+| WARN | H100 node cordoned | unschedulable for over 2 h |
+| WARN | GPU jobs waiting for runners | median H100 queue wait over 30 min in the last 2 h |
+| WARN | NPD condition Unknown | an NPD condition Unknown for over half of the last 6 h (plugin timeouts) |
+| WARN | GPU memory held by no pod | over 2 GiB allocated with no pod attached for 30 min |
+| WARN | GPU over 85C | for 15 min |
+| WARN | Workflow runs queued over 24h | runs that will never be picked up |
+
+### Noise rules
+
+- An issue opens on the first sighting and is edited in place while the problem persists,
+  which the Slack app does not relay.
+- A state finding closes only after it has been absent for two consecutive runs. Checks that
+  were not evaluated (Prometheus down) are never closed.
+- Event findings (XID) never auto-close and get at most one comment per 24 h. An XID issue a
+  human closed is not recreated within the hour the lookback still sees the same event.
+- Kernel OOM kills appear in the job summary only: container-limit OOMs match too.
+- The GitHub side stays under about 80 API requests per run (one page of recent runs, capped
+  at 40 for wait statistics, plus the queued and in-progress runs for starvation).

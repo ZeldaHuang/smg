@@ -40,13 +40,15 @@ ISSUE_LABEL = "ci-node-health"
 H100_LABELS = ("1-gpu-h100", "2-gpu-h100", "4-gpu-h100")
 CLOSE_AFTER = timedelta(minutes=90)
 COMMENT_EVERY = timedelta(hours=24)
+EVENT_REOPEN_GRACE = timedelta(hours=1)  # the gpu_xid lookback window
 QUEUE_WINDOW = timedelta(hours=2)
+MAX_RECENT_RUNS = 40  # one jobs request per run: bounds the API fan-out
 STARVED_AFTER = timedelta(minutes=60)
 STALE_RUN_AFTER = timedelta(hours=24)
 QUEUE_WAIT_P50_MIN = 30.0
 MARKER_PREFIX = "<!-- ci-node-health "
 MARKER_SUFFIX = " -->"
-SPEC = "docs/superpowers/specs/2026-09-20-h100-ci-node-health-design.md"
+DOCS_PATH = "scripts/k8s-runner-resources/README.md#ci-node-health-monitor"
 DEFAULT_PROM_URL = "http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090"
 
 
@@ -55,6 +57,8 @@ DEFAULT_PROM_URL = "http://prometheus-kube-prometheus-prometheus.monitoring.svc:
 
 @dataclass(frozen=True)
 class Check:
+    """One monitored condition: what it means and what to do first."""
+
     key: str
     severity: str  # "CRIT" or "WARN"
     title: str
@@ -65,6 +69,8 @@ class Check:
 
 @dataclass(frozen=True)
 class Finding:
+    """A check that fired for one scope (node, runner label, or \"github\")."""
+
     check: Check
     scope: str  # node name, runner label, or "github"
     detail: str
@@ -196,11 +202,14 @@ class PromError(RuntimeError):
 
 
 class Prom:
+    """Minimal Prometheus HTTP API v1 client (instant queries only)."""
+
     def __init__(self, url: str, timeout: float = 30.0) -> None:
         self.url = url.rstrip("/")
         self.timeout = timeout
 
     def query(self, promql: str) -> list[dict]:
+        """Instant query; returns the result vector or raises PromError."""
         data = urllib.parse.urlencode({"query": promql}).encode()
         req = urllib.request.Request(f"{self.url}/api/v1/query", data=data)
         try:
@@ -224,6 +233,8 @@ def node_of(metric: dict) -> str:
 
 @dataclass(frozen=True)
 class PromCheck:
+    """A check evaluated from one PromQL instant query."""
+
     check: Check
     promql: str
     detail: Callable[[dict, float], str]
@@ -272,8 +283,8 @@ PROM_CHECKS: tuple[PromCheck, ...] = (
     ),
     PromCheck(
         CHECKS["npd_unknown"],
-        "max by (node, condition) "
-        '(avg_over_time(kube_node_status_condition{status="unknown"}[6h])) > 0.5',
+        "max by (node, condition) (avg_over_time(kube_node_status_condition"
+        f'{{condition=~"{NPD_CONDITIONS}",status="unknown"}}[6h])) > 0.5',
         lambda m, v: f"{m['condition']} Unknown {v * 100:.0f}% of the last 6h",
     ),
     # A subquery, not min_over_time: when a GPU gets attributed to a pod, its
@@ -298,10 +309,12 @@ PROM_CHECKS: tuple[PromCheck, ...] = (
 
 
 def h100_nodes(prom: Prom) -> set[str]:
+    """Nodes that expose 8 GPUs, which is the H100 shape in this cluster."""
     return {node_of(s["metric"]) for s in prom.query(H100_NODES_QUERY)}
 
 
 def prom_findings(prom: Prom, nodes: set[str]) -> list[Finding]:
+    """Run every PromQL check and keep the samples that belong to H100 nodes."""
     findings: list[Finding] = []
     for pc in PROM_CHECKS:
         for sample in prom.query(pc.promql):
@@ -321,6 +334,8 @@ class GitHubError(RuntimeError):
 
 
 class GitHub:
+    """Minimal GitHub REST client scoped to one repository."""
+
     def __init__(self, repo: str, token: str | None, timeout: float = 30.0) -> None:
         self.base = f"https://api.github.com/repos/{repo}"
         self.token = token
@@ -349,17 +364,21 @@ class GitHub:
             raise GitHubError(f"{method} {path} failed: {exc}") from exc
 
     def get(self, path: str, params: dict | None = None):
+        """GET a repository-relative path."""
         return self._request("GET", path, params, None)
 
     def post(self, path: str, body: dict):
+        """POST a JSON body to a repository-relative path."""
         return self._request("POST", path, None, body)
 
     def patch(self, path: str, body: dict):
+        """PATCH a JSON body to a repository-relative path."""
         return self._request("PATCH", path, None, body)
 
     def paginate(
         self, path: str, key: str | None, params: dict | None = None, max_pages: int = 3
     ) -> list:
+        """Collect up to max_pages pages of 100 items; key selects the array field."""
         items: list = []
         base = dict(params or {}, per_page=100)
         for page in range(1, max_pages + 1):
@@ -372,62 +391,90 @@ class GitHub:
 
 
 def parse_ts(value: str) -> datetime:
+    """Parse a GitHub API timestamp (RFC 3339 with a trailing Z)."""
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 @dataclass
 class QueueStats:
+    """Runner-queue numbers shown in the job summary."""
+
     waits_min: list[float] = field(default_factory=list)
     queued_h100: int = 0
-    online_runners: dict[str, int] = field(default_factory=dict)
+    sampled_runs: int = 0
+    active_runs: int = 0
+
+
+def _h100_labels(job: dict) -> list[str]:
+    return [lab for lab in job.get("labels") or [] if lab in H100_LABELS]
+
+
+def _jobs(gh: GitHub, run: dict) -> list:
+    return gh.paginate(f"actions/runs/{run['id']}/jobs", "jobs", max_pages=1)
 
 
 def github_findings(gh: GitHub, now: datetime) -> tuple[list[Finding], QueueStats]:
+    """Evaluate the runner-queue checks from the GitHub Actions API.
+
+    Request budget per run: one runs listing plus at most MAX_RECENT_RUNS jobs
+    requests for the wait statistics, then two run listings (queued and
+    in-progress) with one jobs request each for the starvation check. Every
+    listing reads a single page, so a busy hour costs roughly 80 requests out
+    of the 1,000 per hour GITHUB_TOKEN gets for the repository.
+    """
     findings: list[Finding] = []
     stats = QueueStats()
 
+    # Wait statistics: H100 jobs that started in recently created runs. A
+    # job's created_at is set when it becomes eligible (after its needs), so
+    # started_at - created_at is the time spent waiting for a runner.
     since = (now - QUEUE_WINDOW).strftime("%Y-%m-%dT%H:%M:%SZ")
-    for run in gh.paginate("actions/runs", "workflow_runs", {"created": f">={since}"}):
-        for job in gh.paginate(f"actions/runs/{run['id']}/jobs", "jobs", max_pages=2):
-            labels = [lab for lab in job.get("labels") or [] if lab in H100_LABELS]
-            if not labels:
-                continue
-            created = parse_ts(job["created_at"])
-            if job["status"] == "queued":
-                stats.queued_h100 += 1
-                age = now - created
-                if age >= STARVED_AFTER:
-                    minutes = age.total_seconds() / 60
-                    findings.append(
-                        Finding(
-                            CHECKS["runner_starved"],
-                            labels[0],
-                            f"{job['name']} queued {minutes:.0f} min ({job['html_url']})",
-                        )
-                    )
-            elif job.get("started_at"):
-                wait = parse_ts(job["started_at"]) - created
+    recent = gh.paginate("actions/runs", "workflow_runs", {"created": f">={since}"}, max_pages=1)[
+        :MAX_RECENT_RUNS
+    ]
+    stats.sampled_runs = len(recent)
+    for run in recent:
+        for job in _jobs(gh, run):
+            if _h100_labels(job) and job.get("started_at") and job.get("created_at"):
+                wait = parse_ts(job["started_at"]) - parse_ts(job["created_at"])
                 stats.waits_min.append(wait.total_seconds() / 60)
 
-    runners = gh.paginate("actions/runners", "runners")
-    for label in H100_LABELS:
-        online = sum(
-            1 for r in runners if r["name"].startswith(f"{label}-") and r["status"] == "online"
-        )
-        stats.online_runners[label] = online
-        if online == 0:
-            findings.append(Finding(CHECKS["runner_starved"], label, "no online runner registered"))
-
-    for run in gh.paginate("actions/runs", "workflow_runs", {"status": "queued"}, max_pages=2):
-        age = now - parse_ts(run["created_at"])
-        if age >= STALE_RUN_AFTER:
-            findings.append(
-                Finding(
-                    CHECKS["stale_queued_runs"],
-                    "github",
-                    f"{run['name']} run {run['id']} queued {age.days}d ({run['html_url']})",
+    # Starvation: H100 jobs still queued in any unfinished run, however old
+    # the run is. Runs queued for over a day are reported as stale instead.
+    queued_runs = gh.paginate("actions/runs", "workflow_runs", {"status": "queued"}, max_pages=1)
+    in_progress = gh.paginate(
+        "actions/runs", "workflow_runs", {"status": "in_progress"}, max_pages=1
+    )
+    stale = [r for r in queued_runs if now - parse_ts(r["created_at"]) >= STALE_RUN_AFTER]
+    stale_ids = {r["id"] for r in stale}
+    active_runs = [r for r in queued_runs + in_progress if r["id"] not in stale_ids]
+    stats.active_runs = len(active_runs)
+    for run in active_runs:
+        for job in _jobs(gh, run):
+            labels = _h100_labels(job)
+            if not labels or job.get("status") != "queued":
+                continue
+            stats.queued_h100 += 1
+            age = now - parse_ts(job["created_at"])
+            if age >= STARVED_AFTER:
+                minutes = age.total_seconds() / 60
+                findings.append(
+                    Finding(
+                        CHECKS["runner_starved"],
+                        labels[0],
+                        f"{job['name']} queued {minutes:.0f} min ({job['html_url']})",
+                    )
                 )
+
+    for run in stale:
+        age = now - parse_ts(run["created_at"])
+        findings.append(
+            Finding(
+                CHECKS["stale_queued_runs"],
+                "github",
+                f"{run['name']} run {run['id']} queued {age.days}d ({run['html_url']})",
             )
+        )
 
     if stats.waits_min:
         p50 = statistics.median(stats.waits_min)
@@ -447,6 +494,8 @@ def github_findings(gh: GitHub, now: datetime) -> tuple[list[Finding], QueueStat
 
 @dataclass
 class IssueState:
+    """What the marker in an open monitor issue remembers between runs."""
+
     number: int
     key: str
     first_seen: datetime
@@ -457,6 +506,8 @@ class IssueState:
 
 @dataclass(frozen=True)
 class Op:
+    """One planned issue operation."""
+
     kind: str  # "create" | "update" | "comment" | "close"
     number: int | None
     key: str
@@ -464,8 +515,9 @@ class Op:
     body: str
 
 
-def parse_issue(issue: dict) -> IssueState | None:
-    body = issue.get("body") or ""
+def _marker(body: str | None) -> dict | None:
+    """The JSON marker the monitor leaves at the end of an issue body."""
+    body = body or ""
     start = body.rfind(MARKER_PREFIX)
     if start < 0:
         return None
@@ -475,6 +527,21 @@ def parse_issue(issue: dict) -> IssueState | None:
     try:
         marker = json.loads(body[start + len(MARKER_PREFIX) : end])
     except ValueError:
+        return None
+    return marker if isinstance(marker, dict) else None
+
+
+def issue_key(issue: dict) -> str | None:
+    """The check key of a monitor issue, open or closed; None for other issues."""
+    marker = _marker(issue.get("body"))
+    key = marker.get("key") if marker else None
+    return key if isinstance(key, str) else None
+
+
+def parse_issue(issue: dict) -> IssueState | None:
+    """Rebuild the state of an open monitor issue from its marker."""
+    marker = _marker(issue.get("body"))
+    if marker is None:
         return None
     try:
         return IssueState(
@@ -494,6 +561,7 @@ def parse_issue(issue: dict) -> IssueState | None:
 
 
 def group_by_check(findings: list[Finding]) -> dict[str, list[Finding]]:
+    """Findings keyed by check key: one issue per key."""
     grouped: dict[str, list[Finding]] = {}
     for f in findings:
         grouped.setdefault(f.check.key, []).append(f)
@@ -501,20 +569,29 @@ def group_by_check(findings: list[Finding]) -> dict[str, list[Finding]]:
 
 
 def _scopes(findings: list[Finding]) -> list[str]:
+    """Sorted, de-duplicated scopes of a group of findings."""
     return sorted({f.scope for f in findings})
 
 
 def render_title(check: Check, findings: list[Finding]) -> str:
+    """Issue title: severity, check title, and the affected scopes."""
     return f"[node-health][{check.severity}] {check.title}: {', '.join(_scopes(findings))}"
 
 
 def _fmt(dt: datetime) -> str:
+    """Human timestamp for issue bodies and summaries."""
     return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def render_body(
-    check: Check, findings: list[Finding], state: IssueState, now: datetime, run_url: str
+    check: Check,
+    findings: list[Finding],
+    state: IssueState,
+    now: datetime,
+    run_url: str,
+    docs_url: str = "",
 ) -> str:
+    """Issue body: meaning, per-scope table, first action, links, and the marker."""
     rows = "\n".join(
         f"| {f.scope} | {f.detail} | {_fmt(state.nodes.get(f.scope, now))} |"
         for f in sorted(findings, key=lambda f: (f.scope, f.detail))
@@ -531,13 +608,16 @@ def render_body(
         if check.event
         else "Closed automatically once the condition has been clear for two consecutive runs."
     )
+    links = f"[monitor run]({run_url})"
+    if docs_url:
+        links += f" · [how this monitor works]({docs_url})"
     return (
         f"**H100 CI node health** · {check.severity} · {check.title}\n\n"
         f"{check.meaning}\n\n"
         f"| Scope | Detail | First seen |\n|---|---|---|\n{rows}\n\n"
         f"**First action:** {check.first_action}\n\n"
         f"{lifecycle}\n\n"
-        f"Last checked {_fmt(now)} · [monitor run]({run_url}) · [spec]({SPEC})\n\n"
+        f"Last checked {_fmt(now)} · {links}\n\n"
         f"{MARKER_PREFIX}{json.dumps(marker, sort_keys=True)}{MARKER_SUFFIX}\n"
     )
 
@@ -547,14 +627,29 @@ def plan_ops(
     active: dict[str, list[Finding]],
     now: datetime,
     run_url: str,
+    docs_url: str = "",
+    evaluated: set[str] | None = None,
+    recently_closed: dict[str, datetime] | None = None,
 ) -> list[Op]:
+    """Diff active findings against open issues and return the issue operations.
+
+    ``evaluated`` lists the check keys that actually ran this time; issues for
+    other keys are left alone rather than closed (a Prometheus outage must not
+    "resolve" a disk-full issue). ``recently_closed`` maps check keys to the
+    time a human closed the issue; an event check inside EVENT_REOPEN_GRACE is
+    not recreated, since its lookback still sees the same event.
+    """
     ops: list[Op] = []
     by_key = {s.key: s for s in open_states}
+    recently_closed = recently_closed or {}
 
     for key, findings in active.items():
         check = CHECKS[key]
         state = by_key.get(key)
         if state is None:
+            closed_at = recently_closed.get(key)
+            if check.event and closed_at is not None and now - closed_at < EVENT_REOPEN_GRACE:
+                continue
             nodes = {scope: now for scope in _scopes(findings)}
             fresh = IssueState(0, key, now, now, now if check.event else None, nodes)
             ops.append(
@@ -563,7 +658,7 @@ def plan_ops(
                     None,
                     key,
                     render_title(check, findings),
-                    render_body(check, findings, fresh, now, run_url),
+                    render_body(check, findings, fresh, now, run_url, docs_url),
                 )
             )
             continue
@@ -580,7 +675,7 @@ def plan_ops(
                 state.number,
                 key,
                 render_title(check, findings),
-                render_body(check, findings, state, now, run_url),
+                render_body(check, findings, state, now, run_url, docs_url),
             )
         )
         if comment:
@@ -599,6 +694,8 @@ def plan_ops(
         check = CHECKS.get(state.key)
         if state.key in active or check is None or check.event:
             continue
+        if evaluated is not None and state.key not in evaluated:
+            continue
         if now - state.last_seen >= CLOSE_AFTER:
             body = (
                 f"Resolved: clear for two consecutive runs as of {_fmt(now)} "
@@ -611,6 +708,7 @@ def plan_ops(
 
 
 def apply_ops(gh: GitHub, ops: list[Op], dry_run: bool) -> None:
+    """Perform (or, in dry-run mode, print) the planned issue operations."""
     for op in ops:
         label = f"{op.kind} #{op.number}" if op.number else op.kind
         mode = "dry-run" if dry_run else "apply"
@@ -631,6 +729,7 @@ def apply_ops(gh: GitHub, ops: list[Op], dry_run: bool) -> None:
 
 
 def ensure_label(gh: GitHub, dry_run: bool) -> None:
+    """Create the issue label once; 422 means it already exists."""
     if dry_run:
         return
     try:
@@ -643,20 +742,34 @@ def ensure_label(gh: GitHub, dry_run: bool) -> None:
             },
         )
     except GitHubError as exc:
-        if "422" not in str(exc):  # 422 = already exists
+        if "422" not in str(exc):
             raise
 
 
-def open_issue_states(gh: GitHub) -> list[IssueState]:
-    issues = gh.paginate("issues", None, {"labels": ISSUE_LABEL, "state": "open"})
-    states = []
-    for issue in issues:
+def issue_states(gh: GitHub) -> tuple[list[IssueState], dict[str, datetime]]:
+    """Open monitor issues as state, plus the latest close time per check key."""
+    open_states = []
+    for issue in gh.paginate("issues", None, {"labels": ISSUE_LABEL, "state": "open"}):
         if "pull_request" in issue:
             continue
         state = parse_issue(issue)
         if state is not None:
-            states.append(state)
-    return states
+            open_states.append(state)
+    recently_closed: dict[str, datetime] = {}
+    closed = gh.paginate(
+        "issues",
+        None,
+        {"labels": ISSUE_LABEL, "state": "closed", "sort": "updated", "direction": "desc"},
+        max_pages=1,
+    )
+    for issue in closed:
+        key = issue_key(issue)
+        if key is None or not issue.get("closed_at"):
+            continue
+        closed_at = parse_ts(issue["closed_at"])
+        if key not in recently_closed or closed_at > recently_closed[key]:
+            recently_closed[key] = closed_at
+    return open_states, recently_closed
 
 
 # --- fleet summary -----------------------------------------------------------
@@ -692,6 +805,7 @@ FLEET_QUERIES: dict[str, str] = {
 
 
 def fleet_rows(prom: Prom, nodes: set[str]) -> list[dict]:
+    """One summary row per H100 node; missing metrics stay None."""
     rows = {node: {"node": node, **{k: None for k in FLEET_QUERIES}} for node in sorted(nodes)}
     for column, promql in FLEET_QUERIES.items():
         for sample in prom.query(promql):
@@ -702,14 +816,17 @@ def fleet_rows(prom: Prom, nodes: set[str]) -> list[dict]:
 
 
 def _cell(value: float | None, fmt: str = "{:.0f}") -> str:
+    """Table cell for an optional number."""
     return "-" if value is None else fmt.format(value)
 
 
 def _pct(value: float | None) -> str:
+    """Table cell for an optional ratio, as a percentage."""
     return "-" if value is None else f"{value * 100:.0f}%"
 
 
 def _p95(values: list[float]) -> float:
+    """Nearest-rank 95th percentile."""
     ordered = sorted(values)
     return ordered[min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))]
 
@@ -717,6 +834,7 @@ def _p95(values: list[float]) -> float:
 def render_summary(
     rows: list[dict], stats: QueueStats, findings: list[Finding], now: datetime
 ) -> str:
+    """Markdown for the job summary: fleet table, queue numbers, active findings."""
     lines = [
         f"## H100 CI node health · {_fmt(now)}",
         "",
@@ -740,8 +858,10 @@ def render_summary(
         )
     else:
         lines.append(f"No H100 jobs started in the last 2h. Queued now: {stats.queued_h100}.")
-    online = ", ".join(f"{k}={v}" for k, v in stats.online_runners.items())
-    lines.append(f"Online runners: {online or 'unknown'}.")
+    lines.append(
+        f"Wait statistics from {stats.sampled_runs} recent runs (cap {MAX_RECENT_RUNS}); "
+        f"{stats.active_runs} queued or in-progress runs scanned for starvation."
+    )
     lines.append("")
     if findings:
         lines.append("### Active findings")
@@ -763,6 +883,11 @@ def _run_url() -> str:
     return f"{server}/{repo}/actions/runs/{run_id}" if repo and run_id else server
 
 
+def _docs_url(repo: str) -> str:
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    return f"{server}/{repo}/blob/main/{DOCS_PATH}"
+
+
 def _write_summary(text: str) -> None:
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if path:
@@ -773,6 +898,7 @@ def _write_summary(text: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run every check once and reconcile the issues. Exit 1 if Prometheus was down, 2 on GitHub errors."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--dry-run", action="store_true", help="print issue ops, write nothing")
     parser.add_argument("--prom-url", default=os.environ.get("PROM_URL", DEFAULT_PROM_URL))
@@ -788,6 +914,7 @@ def main(argv: list[str] | None = None) -> int:
 
     findings: list[Finding] = []
     rows: list[dict] = []
+    evaluated = set(CHECKS)
     prom_ok = True
     try:
         nodes = h100_nodes(prom)
@@ -795,6 +922,7 @@ def main(argv: list[str] | None = None) -> int:
         rows = fleet_rows(prom, nodes)
     except PromError as exc:
         prom_ok = False
+        evaluated -= {pc.check.key for pc in PROM_CHECKS}
         print(f"::error::{exc}")
         findings.append(Finding(CHECKS["monitor_blind"], "prometheus", str(exc)[:200]))
 
@@ -802,7 +930,16 @@ def main(argv: list[str] | None = None) -> int:
         gh_findings, stats = github_findings(gh, now)
         findings.extend(gh_findings)
         ensure_label(gh, args.dry_run)
-        ops = plan_ops(open_issue_states(gh), group_by_check(findings), now, run_url)
+        open_states, recently_closed = issue_states(gh)
+        ops = plan_ops(
+            open_states,
+            group_by_check(findings),
+            now,
+            run_url,
+            docs_url=_docs_url(args.repo),
+            evaluated=evaluated,
+            recently_closed=recently_closed,
+        )
         apply_ops(gh, ops, args.dry_run)
     except GitHubError as exc:
         print(f"::error::{exc}")

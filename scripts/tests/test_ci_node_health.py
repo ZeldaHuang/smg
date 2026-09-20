@@ -140,9 +140,17 @@ class FakeGitHub:
         self.table = table
         self.writes: list[tuple[str, str, dict]] = []
 
+    @staticmethod
+    def key(path: str, params: dict | None) -> str:
+        params = params or {}
+        for name in ("status", "state"):
+            if name in params:
+                return f"{path}?{name}={params[name]}"
+        return path
+
     def get(self, path: str, params: dict | None = None):
         page = int((params or {}).get("page", 1))
-        payload = self.table.get(path, [])
+        payload = self.table.get(self.key(path, params), [])
         if isinstance(payload, dict):
             key = next(k for k in ("workflow_runs", "jobs", "runners") if k in payload)
             items = payload[key] if page == 1 else []
@@ -177,13 +185,20 @@ def _job(name, label, created, started=None, status="completed", url="https://j"
     }
 
 
-def _runners(*names):
-    return {"runners": [{"name": n, "status": "online", "labels": []} for n in names]}
+def _run(run_id, created, name="PR Test"):
+    return {
+        "id": run_id,
+        "name": name,
+        "created_at": _ts(created),
+        "html_url": f"https://r/{run_id}",
+    }
 
 
-ALL_ONLINE = _runners(
-    "1-gpu-h100-abc-runner-1", "2-gpu-h100-abc-runner-1", "4-gpu-h100-abc-runner-1"
-)
+NO_ACTIVE_RUNS = {
+    "actions/runs?status=queued": {"workflow_runs": []},
+    "actions/runs?status=in_progress": {"workflow_runs": []},
+}
+NO_ISSUES = {"issues?state=open": [], "issues?state=closed": []}
 
 
 def test_parse_ts_reads_github_timestamps(mod):
@@ -193,9 +208,7 @@ def test_parse_ts_reads_github_timestamps(mod):
 def test_queue_wait_uses_job_created_to_started(mod):
     gh = FakeGitHub(
         {
-            "actions/runs": {
-                "workflow_runs": [{"id": 1, "name": "PR Test", "created_at": _ts(NOW)}]
-            },
+            "actions/runs": {"workflow_runs": [_run(1, NOW)]},
             "actions/runs/1/jobs": {
                 "jobs": [
                     _job(
@@ -218,52 +231,57 @@ def test_queue_wait_uses_job_created_to_started(mod):
                     ),
                 ]
             },
-            "actions/runners": ALL_ONLINE,
+            **NO_ACTIVE_RUNS,
         }
     )
     findings, stats = mod.github_findings(gh, NOW)
     assert sorted(stats.waits_min) == [50.0, 70.0]  # the CPU job is not counted
+    assert stats.sampled_runs == 1
     assert [f.check.key for f in findings] == ["queue_wait"]
     assert findings[0].detail.startswith("p50 60 min")
 
 
-def test_queued_h100_job_over_an_hour_is_starved(mod):
-    gh = FakeGitHub(
-        {
-            "actions/runs": {
-                "workflow_runs": [{"id": 1, "name": "PR Test", "created_at": _ts(NOW)}]
-            },
-            "actions/runs/1/jobs": {
-                "jobs": [
-                    _job(
-                        "e2e-4gpu / run",
-                        "4-gpu-h100",
-                        NOW - timedelta(minutes=75),
-                        status="queued",
-                    )
-                ]
-            },
-            "actions/runners": ALL_ONLINE,
-        }
-    )
-    findings, stats = mod.github_findings(gh, NOW)
-    assert stats.queued_h100 == 1
-    assert [(f.check.key, f.scope) for f in findings] == [("runner_starved", "4-gpu-h100")]
-    assert "queued 75 min" in findings[0].detail
-
-
-def test_label_with_no_online_runner_is_starved(mod):
+def test_queued_h100_job_in_old_in_progress_run_is_starved(mod):
+    # The run started 5h ago (outside the 2h wait-statistics window) and one
+    # H100 job has been queued for 3h: the starvation check must still see it.
+    old = NOW - timedelta(hours=5)
     gh = FakeGitHub(
         {
             "actions/runs": {"workflow_runs": []},
-            "actions/runners": _runners("1-gpu-h100-abc-runner-1", "4-gpu-h100-abc-runner-1"),
+            "actions/runs?status=queued": {"workflow_runs": []},
+            "actions/runs?status=in_progress": {"workflow_runs": [_run(1, old)]},
+            "actions/runs/1/jobs": {
+                "jobs": [
+                    _job("build", "k8s-runner-cpu", old, old, status="completed"),
+                    _job("e2e-4gpu / run", "4-gpu-h100", NOW - timedelta(hours=3), status="queued"),
+                    _job(
+                        "e2e-1gpu / run", "1-gpu-h100", NOW - timedelta(minutes=5), status="queued"
+                    ),
+                ]
+            },
         }
     )
     findings, stats = mod.github_findings(gh, NOW)
-    assert stats.online_runners == {"1-gpu-h100": 1, "2-gpu-h100": 0, "4-gpu-h100": 1}
-    assert [(f.check.key, f.scope, f.detail) for f in findings] == [
-        ("runner_starved", "2-gpu-h100", "no online runner registered")
-    ]
+    assert stats.queued_h100 == 2  # both queued H100 jobs are counted
+    assert stats.active_runs == 1
+    assert [(f.check.key, f.scope) for f in findings] == [("runner_starved", "4-gpu-h100")]
+    assert "queued 180 min" in findings[0].detail
+
+
+def test_github_findings_never_calls_the_runners_endpoint(mod):
+    # GET actions/runners needs repository Administration permission, which the
+    # workflow GITHUB_TOKEN cannot be granted.
+    calls: list[str] = []
+    gh = FakeGitHub({"actions/runs": {"workflow_runs": []}, **NO_ACTIVE_RUNS})
+    original = gh.get
+
+    def spy(path, params=None):
+        calls.append(path)
+        return original(path, params)
+
+    gh.get = spy
+    mod.github_findings(gh, NOW)
+    assert calls and all(not c.startswith("actions/runners") for c in calls)
 
 
 def test_stale_queued_runs_older_than_a_day(mod):
@@ -271,32 +289,20 @@ def test_stale_queued_runs_older_than_a_day(mod):
     fresh = NOW - timedelta(hours=2)
     gh = FakeGitHub(
         {
-            "actions/runs": {
-                "workflow_runs": [
-                    {
-                        "id": 5,
-                        "name": "Nightly tau2",
-                        "created_at": _ts(old),
-                        "html_url": "https://r/5",
-                    },
-                    {
-                        "id": 6,
-                        "name": "PR Test",
-                        "created_at": _ts(fresh),
-                        "html_url": "https://r/6",
-                    },
-                ]
+            "actions/runs": {"workflow_runs": []},
+            "actions/runs?status=queued": {
+                "workflow_runs": [_run(5, old, "Nightly tau2"), _run(6, fresh)]
             },
-            "actions/runs/5/jobs": {"jobs": []},
+            "actions/runs?status=in_progress": {"workflow_runs": []},
+            # the zombie run's job would count as starved; stale wins instead
+            "actions/runs/5/jobs": {"jobs": [_job("bench", "4-gpu-h100", old, status="queued")]},
             "actions/runs/6/jobs": {"jobs": []},
-            "actions/runners": ALL_ONLINE,
         }
     )
-    findings, _ = mod.github_findings(gh, NOW)
-    stale = [f for f in findings if f.check.key == "stale_queued_runs"]
-    assert len(stale) == 1
-    assert stale[0].scope == "github"
-    assert "Nightly tau2 run 5 queued 3d" in stale[0].detail
+    findings, stats = mod.github_findings(gh, NOW)
+    assert [(f.check.key, f.scope) for f in findings] == [("stale_queued_runs", "github")]
+    assert "Nightly tau2 run 5 queued 3d" in findings[0].detail
+    assert stats.active_runs == 1  # only the fresh queued run was scanned
 
 
 # --- issue reconciliation ----------------------------------------------------
@@ -444,6 +450,61 @@ def test_plan_ops_ignores_issues_with_unknown_keys(mod):
     assert mod.plan_ops([weird], {}, NOW, "https://run/6") == []
 
 
+def test_plan_ops_leaves_unevaluated_checks_open(mod):
+    # Prometheus was down: disk_full was not evaluated, so its issue must not
+    # be closed as "resolved" even though it has been absent for two runs.
+    disk = mod.parse_issue(
+        _issue(mod, 2, "disk_full", NOW - timedelta(hours=4), NOW - timedelta(minutes=95))
+    )
+    stale = mod.parse_issue(
+        _issue(mod, 3, "stale_queued_runs", NOW - timedelta(hours=4), NOW - timedelta(minutes=95))
+    )
+    evaluated = set(mod.CHECKS) - {pc.check.key for pc in mod.PROM_CHECKS}
+    ops = mod.plan_ops([disk, stale], {}, NOW, "https://run/7", evaluated=evaluated)
+    assert [(o.kind, o.number) for o in ops] == [("close", 3)]
+
+
+def test_plan_ops_does_not_recreate_event_issue_closed_within_grace(mod):
+    active = mod.group_by_check([_finding(mod, "gpu_xid", "10.0.1.1")])
+    just_closed = {"gpu_xid": NOW - timedelta(minutes=20)}
+    assert mod.plan_ops([], active, NOW, "https://run/8", recently_closed=just_closed) == []
+    long_ago = {"gpu_xid": NOW - timedelta(hours=2)}
+    ops = mod.plan_ops([], active, NOW, "https://run/8", recently_closed=long_ago)
+    assert [o.kind for o in ops] == ["create"]
+    # state checks are never suppressed by a recent close
+    cordon = mod.group_by_check([_finding(mod, "node_cordoned", "10.0.1.1")])
+    closed = {"node_cordoned": NOW - timedelta(minutes=20)}
+    ops = mod.plan_ops([], cordon, NOW, "https://run/8", recently_closed=closed)
+    assert [o.kind for o in ops] == ["create"]
+
+
+def test_render_body_links_docs_when_given(mod):
+    check = mod.CHECKS["node_cordoned"]
+    state = mod.IssueState(0, "node_cordoned", NOW, NOW, None, {})
+    body = mod.render_body(check, [], state, NOW, "https://run/1", "https://docs/readme#x")
+    assert "[how this monitor works](https://docs/readme#x)" in body
+    assert "docs/superpowers" not in body
+
+
+def test_issue_states_reads_open_state_and_latest_close_per_key(mod):
+    open_issue = _issue(mod, 1, "node_cordoned", NOW - timedelta(hours=3), NOW - timedelta(hours=1))
+    closed_new = dict(_issue(mod, 2, "gpu_xid", NOW - timedelta(days=1), NOW - timedelta(days=1)))
+    closed_new["closed_at"] = _ts(NOW - timedelta(minutes=30))
+    auto_closed_marker = json.dumps({"key": "gpu_xid", "closed": "x"})
+    closed_old = {
+        "number": 3,
+        "closed_at": _ts(NOW - timedelta(days=2)),
+        "body": f"Resolved.\n\n{mod.MARKER_PREFIX}{auto_closed_marker}{mod.MARKER_SUFFIX}",
+    }
+    human = {"number": 4, "closed_at": _ts(NOW), "body": "not ours"}
+    gh = FakeGitHub(
+        {"issues?state=open": [open_issue], "issues?state=closed": [closed_old, closed_new, human]}
+    )
+    states, recently_closed = mod.issue_states(gh)
+    assert [s.number for s in states] == [1]
+    assert recently_closed == {"gpu_xid": NOW - timedelta(minutes=30)}
+
+
 def test_apply_ops_dry_run_writes_nothing(mod, capsys):
     gh = FakeGitHub({})
     ops = [
@@ -509,11 +570,12 @@ def test_render_summary_mentions_findings_and_queue(mod):
             "oom_24h": None,
         }
     ]
-    stats = mod.QueueStats(waits_min=[5.0, 70.0], queued_h100=1, online_runners={"1-gpu-h100": 10})
+    stats = mod.QueueStats(waits_min=[5.0, 70.0], queued_h100=1, sampled_runs=3, active_runs=2)
     findings = [_finding(mod, "node_cordoned", "10.0.98.28", "unschedulable for over 2h")]
     text = mod.render_summary(rows, stats, findings, NOW)
     assert "| 10.0.98.28 |" in text
     assert "p50 38 min" in text and "p95 " in text
+    assert "3 recent runs" in text and "2 queued or in-progress runs" in text
     assert "node_cordoned" in text and "10.0.98.28" in text
 
 
@@ -530,7 +592,7 @@ def test_main_dry_run_reports_monitor_blind_when_prometheus_is_down(mod, monkeyp
         mod,
         "GitHub",
         lambda *a, **k: FakeGitHub(
-            {"actions/runs": {"workflow_runs": []}, "actions/runners": ALL_ONLINE, "issues": []}
+            {"actions/runs": {"workflow_runs": []}, **NO_ACTIVE_RUNS, **NO_ISSUES}
         ),
     )
     rc = mod.main(["--dry-run", "--repo", "x/y"])

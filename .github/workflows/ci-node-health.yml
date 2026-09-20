@@ -5,7 +5,7 @@ name: CI node health
 # GitHub issue per active problem under the `ci-node-health` label. Slack hears
 # about it through the GitHub Slack app:
 #   /github subscribe smg-project/smg issues label:"ci-node-health"
-# Design: docs/superpowers/specs/2026-09-20-h100-ci-node-health-design.md
+# Docs: scripts/k8s-runner-resources/README.md, section "CI node health monitor".
 #
 # Runbook (issue title -> first action; the issue body repeats it):
 #   [CRIT] H100 node not Ready       kubectl describe node; cordon + OCI ticket if not back in 15 min
@@ -57,6 +57,11 @@ jobs:
           persist-credentials: false
           sparse-checkout: scripts/ci_node_health.py
           sparse-checkout-cone-mode: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
 
       - name: Evaluate node health and reconcile issues
         env:
