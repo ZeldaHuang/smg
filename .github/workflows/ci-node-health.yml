@@ -62,5 +62,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PROM_URL: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
-        run: python3 scripts/ci_node_health.py $DRY_RUN
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python3 scripts/ci_node_health.py "${args[@]}"
