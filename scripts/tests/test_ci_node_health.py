@@ -471,3 +471,68 @@ def test_apply_ops_performs_writes(mod):
         ("POST", "issues/7/comments", {"body": "c"}),
         ("PATCH", "issues/5", {"body": "b5", "state": "closed", "state_reason": "completed"}),
     ]
+
+
+# --- summary and main --------------------------------------------------------
+
+
+def test_fleet_rows_one_per_h100_node_with_defaults(mod):
+    prom = FakeProm(
+        {
+            mod.FLEET_QUERIES["ready"]: [_sample({"node": "10.0.121.183"}, 1)],
+            mod.FLEET_QUERIES["cordoned"]: [_sample({"node": "10.0.98.28"}, 1)],
+            mod.FLEET_QUERIES["root_pct"]: [_sample({"instance": "10.0.121.183:9100"}, 0.53)],
+            mod.FLEET_QUERIES["runner_pods"]: [_sample({"node": "10.0.121.183"}, 4)],
+        }
+    )
+    rows = mod.fleet_rows(prom, H100)
+    assert [r["node"] for r in rows] == ["10.0.121.183", "10.0.98.28"]
+    a, b = rows
+    assert a["ready"] == 1.0 and a["cordoned"] is None
+    assert a["root_pct"] == 0.53 and a["runner_pods"] == 4.0
+    assert b["ready"] is None and b["cordoned"] == 1.0
+
+
+def test_render_summary_mentions_findings_and_queue(mod):
+    rows = [
+        {
+            "node": "10.0.98.28",
+            "ready": None,
+            "cordoned": 1.0,
+            "gpus": 8.0,
+            "npd_true": None,
+            "npd_unknown": None,
+            "root_pct": 0.1,
+            "raid_pct": 0.0,
+            "runner_pods": None,
+            "xid_24h": 0.0,
+            "oom_24h": None,
+        }
+    ]
+    stats = mod.QueueStats(waits_min=[5.0, 70.0], queued_h100=1, online_runners={"1-gpu-h100": 10})
+    findings = [_finding(mod, "node_cordoned", "10.0.98.28", "unschedulable for over 2h")]
+    text = mod.render_summary(rows, stats, findings, NOW)
+    assert "| 10.0.98.28 |" in text
+    assert "p50 38 min" in text and "p95 " in text
+    assert "node_cordoned" in text and "10.0.98.28" in text
+
+
+def test_main_dry_run_reports_monitor_blind_when_prometheus_is_down(mod, monkeypatch, capsys):
+    class DeadProm:
+        def __init__(self, *a, **k):
+            pass
+
+        def query(self, promql):
+            raise mod.PromError("down")
+
+    monkeypatch.setattr(mod, "Prom", DeadProm)
+    monkeypatch.setattr(
+        mod,
+        "GitHub",
+        lambda *a, **k: FakeGitHub(
+            {"actions/runs": {"workflow_runs": []}, "actions/runners": ALL_ONLINE, "issues": []}
+        ),
+    )
+    rc = mod.main(["--dry-run", "--repo", "x/y"])
+    assert rc == 1
+    assert "monitor_blind" in capsys.readouterr().out

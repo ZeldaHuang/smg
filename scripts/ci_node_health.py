@@ -651,8 +651,157 @@ def open_issue_states(gh: GitHub) -> list[IssueState]:
     return states
 
 
+# --- fleet summary -----------------------------------------------------------
+
+FLEET_QUERIES: dict[str, str] = {
+    "ready": 'max by (node) (kube_node_status_condition{condition="Ready",status="true"})',
+    "cordoned": "max by (node) (kube_node_spec_unschedulable)",
+    "gpus": 'max by (node) (kube_node_status_allocatable{resource="nvidia_com_gpu"})',
+    "npd_true": (
+        "sum by (node) (max by (node, condition) "
+        f'(kube_node_status_condition{{condition=~"{NPD_CONDITIONS}",status="true"}}))'
+    ),
+    "npd_unknown": (
+        "sum by (node) (max by (node, condition) "
+        f'(kube_node_status_condition{{condition=~"{NPD_CONDITIONS}",status="unknown"}}))'
+    ),
+    "root_pct": (
+        "max by (instance) (1 - "
+        'node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})'
+    ),
+    "raid_pct": (
+        "max by (instance) (1 - "
+        'node_filesystem_avail_bytes{mountpoint="/raid"} / '
+        'node_filesystem_size_bytes{mountpoint="/raid"})'
+    ),
+    "runner_pods": (
+        "count by (node) (max by (pod, node) "
+        '(kube_pod_info{namespace="actions-runner-system", pod=~".*-runner-.*"}))'
+    ),
+    "xid_24h": "sum by (Hostname) (max by (Hostname, gpu) (changes(DCGM_FI_DEV_XID_ERRORS[24h])))",
+    "oom_24h": 'sum by (kubernetes_node) (increase(problem_counter{reason="OOMKilling"}[24h]))',
+}
+
+
+def fleet_rows(prom: Prom, nodes: set[str]) -> list[dict]:
+    rows = {node: {"node": node, **{k: None for k in FLEET_QUERIES}} for node in sorted(nodes)}
+    for column, promql in FLEET_QUERIES.items():
+        for sample in prom.query(promql):
+            node = node_of(sample["metric"])
+            if node in rows:
+                rows[node][column] = float(sample["value"][1])
+    return list(rows.values())
+
+
+def _cell(value: float | None, fmt: str = "{:.0f}") -> str:
+    return "-" if value is None else fmt.format(value)
+
+
+def _pct(value: float | None) -> str:
+    return "-" if value is None else f"{value * 100:.0f}%"
+
+
+def _p95(values: list[float]) -> float:
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))]
+
+
+def render_summary(
+    rows: list[dict], stats: QueueStats, findings: list[Finding], now: datetime
+) -> str:
+    lines = [
+        f"## H100 CI node health · {_fmt(now)}",
+        "",
+        "| Node | Ready | Cordoned | GPUs | NPD true | NPD unknown | root | /raid | "
+        "runner pods | XID 24h | OOM 24h |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r['node']} | {'yes' if r['ready'] else 'NO'} | {'yes' if r['cordoned'] else '-'} | "
+            f"{_cell(r['gpus'])} | {_cell(r['npd_true'])} | {_cell(r['npd_unknown'])} | "
+            f"{_pct(r['root_pct'])} | {_pct(r['raid_pct'])} | {_cell(r['runner_pods'])} | "
+            f"{_cell(r['xid_24h'])} | {_cell(r['oom_24h'])} |"
+        )
+    lines.append("")
+    if stats.waits_min:
+        lines.append(
+            f"Runner queue wait, last 2h ({len(stats.waits_min)} H100 jobs): "
+            f"p50 {statistics.median(stats.waits_min):.0f} min, "
+            f"p95 {_p95(stats.waits_min):.0f} min. Queued now: {stats.queued_h100}."
+        )
+    else:
+        lines.append(f"No H100 jobs started in the last 2h. Queued now: {stats.queued_h100}.")
+    online = ", ".join(f"{k}={v}" for k, v in stats.online_runners.items())
+    lines.append(f"Online runners: {online or 'unknown'}.")
+    lines.append("")
+    if findings:
+        lines.append("### Active findings")
+        for f in sorted(findings, key=lambda f: (f.check.severity, f.check.key, f.scope)):
+            lines.append(f"- **{f.check.severity}** `{f.check.key}` {f.scope}: {f.detail}")
+    else:
+        lines.append("No active findings.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# --- main --------------------------------------------------------------------
+
+
+def _run_url() -> str:
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    return f"{server}/{repo}/actions/runs/{run_id}" if repo and run_id else server
+
+
+def _write_summary(text: str) -> None:
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(text)
+    else:
+        print(text)
+
+
 def main(argv: list[str] | None = None) -> int:
-    raise SystemExit("main is implemented in Task 4")
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--dry-run", action="store_true", help="print issue ops, write nothing")
+    parser.add_argument("--prom-url", default=os.environ.get("PROM_URL", DEFAULT_PROM_URL))
+    parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
+    args = parser.parse_args(argv)
+    if not args.repo:
+        parser.error("--repo or GITHUB_REPOSITORY is required")
+
+    now = datetime.now(UTC)
+    run_url = _run_url()
+    prom = Prom(args.prom_url)
+    gh = GitHub(args.repo, os.environ.get("GITHUB_TOKEN"))
+
+    findings: list[Finding] = []
+    rows: list[dict] = []
+    prom_ok = True
+    try:
+        nodes = h100_nodes(prom)
+        findings.extend(prom_findings(prom, nodes))
+        rows = fleet_rows(prom, nodes)
+    except PromError as exc:
+        prom_ok = False
+        print(f"::error::{exc}")
+        findings.append(Finding(CHECKS["monitor_blind"], "prometheus", str(exc)[:200]))
+
+    try:
+        gh_findings, stats = github_findings(gh, now)
+        findings.extend(gh_findings)
+        ensure_label(gh, args.dry_run)
+        ops = plan_ops(open_issue_states(gh), group_by_check(findings), now, run_url)
+        apply_ops(gh, ops, args.dry_run)
+    except GitHubError as exc:
+        print(f"::error::{exc}")
+        return 2
+
+    _write_summary(render_summary(rows, stats, findings, now))
+    return 0 if prom_ok else 1
 
 
 if __name__ == "__main__":
