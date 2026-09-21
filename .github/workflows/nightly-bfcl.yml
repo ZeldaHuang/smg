@@ -164,7 +164,7 @@ jobs:
               # all GPU-resident), so it outgrows a TP=4 half-node and runs SEQUENTIAL
               # on the whole node (the only such leg). SMG: deepseek_v41 tool/reasoning parsers
               # + native renderer (#2524/#2525/#2527). vLLM: V4.1 is on main only
-              # (vllm-project/vllm#56208 + #56228, 2026-09-10), not in the 0.27.1 CI
+              # (vllm-project/vllm#56208 + #56228, 2026-09-10), not in the 0.29.0 CI
               # pin, so this leg installs a per-commit main wheel (vllm_commit below).
               {"name": "deepseek-v4.1", "runner": "blackwell", "tp": 8,
                "gpu_a": "0,1,2,3,4,5,6,7", "gpu_b": "",  # sequential: arm B reuses GPU_A (whole node)
@@ -192,7 +192,7 @@ jobs:
               # MiniMax-M3 (427B/26B-active VLM MoE, MSA sparse attention). The official
               # MXFP8 checkpoint (~444GB) fits a TP=4 half-node; nvidia/MiniMax-M3-NVFP4
               # (~224GB, ModelOpt 4-bit, small drops vs FP8) is the fallback if headroom
-              # ever bites. Served by the stock CI vLLM pin (0.27.1 has M3, mxfp8 and the
+              # ever bites. Served by the stock CI vLLM pin (0.29.0 has M3, mxfp8 and the
               # minimax_m3 parsers) — no per-commit wheel. Flags per the vLLM recipe
               # (models/MiniMaxAI/MiniMax-M3.yaml): --block-size 128 is mandatory (MSA
               # sparse_block_size) and the mxfp8 variant sets indexer_kv_dtype fp8.

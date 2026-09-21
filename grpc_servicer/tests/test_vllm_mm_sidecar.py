@@ -73,7 +73,7 @@ def stall_the_first_transaction(client):
 def fingerprint():
     return proto.Fingerprint(
         model="m",
-        vllm_version="0.27.1",
+        vllm_version="0.29.0",
         dtype="torch.bfloat16",
         video_backend="opencv",
         media_io_kwargs="{}",
@@ -122,7 +122,7 @@ class _ModelConfig:
 
 def _fake_vllm(monkeypatch):
     fake = types.ModuleType("vllm")
-    fake.__version__ = "0.27.1"
+    fake.__version__ = "0.29.0"
     fake.envs = types.SimpleNamespace(VLLM_VIDEO_LOADER_BACKEND="opencv")
     monkeypatch.setitem(sys.modules, "vllm", fake)
 
