@@ -157,3 +157,22 @@ pub struct StreamingParseResult {
 ## License
 
 Apache-2.0
+
+### Hy4 (`hy_v4`)
+
+Use `--tool-call-parser hy_v4` for Hunyuan v4 tagged calls. The parser learns
+checkpoint suffixes such as `:6124c78e` from `<tool_calls:6124c78e>` and handles
+`tool_call`, `arg_key` and `arg_value` delimiters across streaming boundaries.
+Tool schemas preserve literal strings and select JSON scalar/container types,
+including `anyOf`, `oneOf` and type arrays. Missing schemas default to strings.
+Each complete call is emitted as one streaming item; argument characters are
+not emitted before the call closes. Truncated prospective calls are flushed
+as text. Buffering is capped at 4 MiB.
+
+This registers an output parser, not a Hy4 structural-tag grammar. Required
+and named tool choices retain SMG's generic JSON-schema constraint path; this
+change does not claim model-level equivalence of constrained generation with
+vLLM's Hy4 grammar. Validate those modes with the serving engine before use.
+
+Format reference: the `hy_v4_tool_parser.py` implementation in vLLM and
+[tencent/Hy4-preview-FP8's pinned chat template](https://huggingface.co/tencent/Hy4-preview-FP8/blob/4215ec29de873a998e849cee902654490c7ff4d1/chat_template.jinja).

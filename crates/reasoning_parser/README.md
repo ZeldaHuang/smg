@@ -272,3 +272,13 @@ The crate is designed for high-concurrency scenarios:
 ## License
 
 Apache-2.0
+
+### Hy4 (`hy_v4`)
+
+`--reasoning-parser hy_v4` recognizes `<think>` / `</think>` and checkpoint
+suffixes such as `<think:6124c78e>`. It preserves structural special tokens
+for parsing and supports arbitrary streaming splits. As with other models
+that have a template toggle, the gateway arms the parser when thinking is
+prefilled. Hy4's `reasoning_effort` defaults to `high`; `no_think` leaves
+completion text in the content channel. An explicit template kwarg takes
+precedence over the top-level effort. Parser reset clears request state.
