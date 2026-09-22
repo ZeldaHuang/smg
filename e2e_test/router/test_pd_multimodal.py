@@ -114,6 +114,21 @@ class TestPDMultimodalKvIsolation:
         assert_mm_processing(gateway, worker_expandable=False)
 
 
+# Disabled on vLLM 0.29.0. Starting a disaggregated vision worker over NIXL
+# crashes inside vLLM's own config validation, intermittently — two of three
+# worker starts in one CI job. 0.29.0 added a NIXL-gated assertion block
+# (vllm-project/vllm@7f4793eaa3) whose first clause reads `model_config.use_mla`
+# before the trivially-true `dcp_size == 1` clause can short-circuit it, and
+# reading that property indexes an architecture list that is empty while a
+# vision model loads its text submodule. There is no configuration that avoids
+# it: it needs only a NIXL transfer config and such a model.
+#
+# Remove this skip when a vLLM release fixes it. Text models over NIXL, and
+# vision models on any other transfer backend, are unaffected.
+@pytest.mark.skip_for_runtime(
+    "vllm",
+    reason="vLLM 0.29.0 crashes starting a disaggregated vision worker over NIXL",
+)
 @pytest.mark.engine("vllm")
 @pytest.mark.gpu(2)
 @pytest.mark.model("Qwen/Qwen3-VL-8B-Instruct")
