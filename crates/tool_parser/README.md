@@ -165,9 +165,18 @@ checkpoint suffixes such as `:6124c78e` from `<tool_calls:6124c78e>` and handles
 `tool_call`, `arg_key` and `arg_value` delimiters across streaming boundaries.
 Tool schemas preserve literal strings and select JSON scalar/container types,
 including `anyOf`, `oneOf` and type arrays. Missing schemas default to strings.
-Each complete call is emitted as one streaming item; argument characters are
-not emitted before the call closes. Truncated prospective calls are flushed
-as text. Buffering is capped at 4 MiB.
+Tool names are emitted once the name boundary is known. Pure-string values
+stream as append-only JSON-escaped fragments; ambiguous unions and non-string
+values wait only for their own value-end marker. Split delimiter prefixes are
+held back, so markup is never emitted into a string. Each call keeps one index
+and receives its closing brace only when the model closes the call.
+
+Unannounced, truncated prospective calls are flushed as text. Announced but
+truncated calls stay incomplete (no fabricated JSON closures and no framing
+leaked as content). Malformed streaming markup returns an error and requires
+reset; already emitted fragments cannot be retracted. Non-streaming malformed
+calls retain the raw-text fallback. Buffered input is capped at 4 MiB; emitted
+string content is discarded from the buffer as it streams.
 
 This registers an output parser, not a Hy4 structural-tag grammar. Required
 and named tool choices retain SMG's generic JSON-schema constraint path; this

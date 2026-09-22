@@ -10,6 +10,8 @@ use crate::{
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
+mod streaming;
+
 const LIMIT: usize = 4 * 1024 * 1024;
 const START: &str = "<tool_calls";
 
@@ -19,6 +21,7 @@ pub struct HyV4Parser {
     suffix: Option<String>,
     index: usize,
     opening: String,
+    stream: streaming::StreamParser,
 }
 
 impl HyV4Parser {
@@ -222,10 +225,16 @@ impl ToolParser for HyV4Parser {
         tools: &[Tool],
     ) -> ParserResult<(String, Vec<ToolCall>)> {
         let mut p = Self::new();
-        let mut result = p.parse_incremental(output, tools).await?;
+        if output.len() > LIMIT {
+            return Err(ParserError::ParsingFailed(
+                "Hy4 tool buffer exceeds 4 MiB".into(),
+            ));
+        }
+        p.buffer.push_str(output);
+        let mut result = p.drain(tools);
         result
             .normal_text
-            .push_str(&p.take_unstreamed_normal_text());
+            .push_str(&format!("{}{}", p.opening, p.buffer));
         Ok((
             result.normal_text,
             result
@@ -245,22 +254,16 @@ impl ToolParser for HyV4Parser {
         chunk: &str,
         tools: &[Tool],
     ) -> ParserResult<StreamingParseResult> {
-        if self.buffer.len().saturating_add(chunk.len()) > LIMIT {
-            return Err(ParserError::ParsingFailed(
-                "Hy4 tool buffer exceeds 4 MiB".into(),
-            ));
-        }
-        self.buffer.push_str(chunk);
-        Ok(self.drain(tools))
+        self.stream.parse(chunk, tools)
     }
+
     fn has_tool_markers(&self, text: &str) -> bool {
         text.contains(START)
     }
     fn take_unstreamed_normal_text(&mut self) -> String {
-        let mut text = std::mem::take(&mut self.opening);
-        text.push_str(&std::mem::take(&mut self.buffer));
-        text
+        self.stream.flush_text()
     }
+
     fn reset(&mut self) {
         *self = Self::new();
     }
