@@ -11,8 +11,6 @@ use validator;
 // Default value helpers
 // ============================================================================
 
-/// Default model for endpoints where model is optional (e.g., /generate).
-/// Uses UNKNOWN_MODEL_ID so routers treat it as "any available worker."
 /// A typed request as a `Value` with every number as the client wrote it.
 /// `serde_json::to_value` stores an `f32` widened to `f64`, so `"top_p":
 /// 0.95` would go upstream as `0.949999988079071`; the writer prints each
@@ -24,6 +22,8 @@ pub fn to_value_exact<T: Serialize>(value: &T) -> serde_json::Result<Value> {
     serde_json::from_slice(&serde_json::to_vec(value)?)
 }
 
+/// Default model for endpoints where model is optional (e.g., /generate).
+/// Uses UNKNOWN_MODEL_ID so routers treat it as "any available worker."
 pub fn default_unknown_model() -> String {
     super::UNKNOWN_MODEL_ID.to_string()
 }

@@ -667,18 +667,32 @@ impl WorkerSelectionStage {
         // A worker that advertises worker-side processing is vision-capable
         // by construction. For a multimodal payload a `--language-model-only`
         // decode worker is left out of the pairing while a vision-capable one
-        // is open (`sequential_pd_decode_form` would refuse the leg with a
-        // non-retryable 400 after selection); with none open the pool is
-        // used as it is, and dispatch names the incompatibility.
+        // can pair (`sequential_pd_decode_form` would refuse the leg with a
+        // non-retryable 400 after selection); with none the pool is used as
+        // it is, and dispatch names the incompatibility. "Can pair" reads
+        // the index: an open prefill with an open vision-capable partner on
+        // its runtime, both on the retained wire when one is pinned.
+        let open = |w: &Arc<dyn Worker>| {
+            w.is_available()
+                && wire.is_none_or(|wire| {
+                    w.metadata().spec.runtime_type == wire.runtime
+                        && *w.connection_mode() == wire.connection
+                })
+        };
         let vision_decode_open = || {
-            pairs.decode_pool.iter().any(|w| {
-                w.is_available()
-                    && vision_capable(w.as_ref())
-                    && wire.is_none_or(|wire| {
-                        w.metadata().spec.runtime_type == wire.runtime
-                            && *w.connection_mode() == wire.connection
+            pairs
+                .prefill
+                .iter()
+                .zip(&pairs.partners)
+                .filter(|(prefill, _)| open(prefill))
+                .any(|(prefill, partners)| {
+                    partners.iter().any(|decode| {
+                        open(decode)
+                            && vision_capable(decode.as_ref())
+                            && decode.metadata().spec.runtime_type
+                                == prefill.metadata().spec.runtime_type
                     })
-            })
+                })
         };
         let candidate_filter: Option<fn(&dyn Worker) -> bool> = if media_refs {
             Some(accepts_media_refs)
@@ -1131,6 +1145,55 @@ mod tests {
             worker_registry.set_worker_overloaded(&worker, true);
         }
         assert!(decode_urls(true).iter().all(|url| url == lmo_url));
+    }
+
+    /// The vision filter is worth applying only when a vision-capable decode
+    /// worker can actually pair: one that no available prefill partners
+    /// (another runtime here) must not shut out the language-model-only
+    /// decode worker the request can still use.
+    #[test]
+    fn an_unpairable_vision_decode_worker_does_not_shut_out_the_pool() {
+        let model_id = "test-model-unpairable-vision";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let register = |url: &str, worker_type: WorkerType, runtime: RuntimeType, lmo: bool| {
+            let mut builder = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model_id))
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(runtime)
+                .health_config(no_health_check());
+            if lmo {
+                builder = builder.label(multimodal::SUPPORTS_VISION_LABEL, "false");
+            }
+            worker_registry.register(Arc::new(builder.build())).unwrap();
+        };
+        register(
+            "grpc://127.0.0.1:8300",
+            WorkerType::Prefill,
+            RuntimeType::Vllm,
+            false,
+        );
+        register(
+            "grpc://127.0.0.1:8310",
+            WorkerType::Decode,
+            RuntimeType::Vllm,
+            true,
+        );
+        register(
+            "grpc://127.0.0.1:8311",
+            WorkerType::Decode,
+            RuntimeType::Sglang,
+            false,
+        );
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::PrefillDecode,
+        );
+        let (_, decode, _) = stage
+            .select_pd_pair(model_id, None, None, None, None, None, None, false, true)
+            .expect("the language-model-only decode worker still pairs");
+        assert_eq!(decode.url(), "grpc://127.0.0.1:8310");
     }
 
     /// A saturated prefill leg is a pressure condition, not model absence.

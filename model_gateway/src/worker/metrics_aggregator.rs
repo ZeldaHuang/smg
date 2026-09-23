@@ -84,11 +84,22 @@ fn sanitize_label_names(
             .iter()
             .any(|n| n.contains(colon_escape))
         {
-            let label_names = family
+            let label_names: Vec<String> = family
                 .get_label_names()
                 .iter()
                 .map(|n| n.replace(colon_escape, "_"))
                 .collect();
+            // Two names that sanitize to one would render a sample with
+            // duplicate label names, which invalidates the whole scrape.
+            let mut unique = label_names.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            if unique.len() != label_names.len() {
+                warn!(
+                    "aggregate_metrics dropped family {name}: label names collide once sanitized"
+                );
+                continue;
+            }
             let rebuilt = PrometheusFamily::new(
                 family.family_name.clone(),
                 label_names,

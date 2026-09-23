@@ -84,14 +84,18 @@ class _ModelConfig:
             self.supports_multimodal_inputs = supports_multimodal_inputs
 
 
-def _fake_vllm_registry(monkeypatch, probe):
-    """Install a fake ``vllm.multimodal`` whose registry probe is ``probe``."""
+def _fake_vllm_registry(monkeypatch, probe, supported=None):
+    """Install a fake ``vllm.multimodal`` whose registry probe is ``probe``
+    and whose supported modalities are ``supported`` (unknown when None)."""
     import sys
     import types
 
     vllm_mod = types.ModuleType("vllm")
     mm_mod = types.ModuleType("vllm.multimodal")
-    mm_mod.MULTIMODAL_REGISTRY = types.SimpleNamespace(supports_multimodal_inputs=probe)
+    registry = types.SimpleNamespace(supports_multimodal_inputs=probe)
+    if supported is not None:
+        registry.get_supported_mm_limits = lambda mc: dict.fromkeys(supported)
+    mm_mod.MULTIMODAL_REGISTRY = registry
     vllm_mod.multimodal = mm_mod
     monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
     monkeypatch.setitem(sys.modules, "vllm.multimodal", mm_mod)
@@ -114,7 +118,7 @@ def test_engine_accepts_mm_inputs_text_model():
     assert not mm_salt.engine_accepts_mm_inputs(_ModelConfig(False, False))
 
 
-def test_engine_accepts_mm_inputs_mm_embeds_only():
+def test_engine_accepts_mm_inputs_mm_embeds_only(monkeypatch):
     # enable_mm_embeds under --language-model-only ingests pre-computed
     # embeddings but has no encoder for pixel payloads; vLLM counts it as
     # accepting mm inputs.
@@ -124,14 +128,23 @@ def test_engine_accepts_mm_inputs_mm_embeds_only():
         mm_config=_MmConfig(language_model_only=True, enable_mm_embeds=True),
     )
     assert not mm_salt.engine_accepts_mm_inputs(flagged)
-    # A zero limit is a limit on that modality, not the absence of the
-    # vision tower: the modalities the config does not list keep their
-    # defaults, so limits alone never conclude language-model-only.
+    # With embeds on, "no pixels" holds only when every pixel modality the
+    # model supports is at 0: an image-only model with image=0 has no use
+    # for its tower, a model that also takes video keeps it.
+    _fake_vllm_registry(monkeypatch, lambda mc: True, supported=["image"])
+    image_only = _ModelConfig(
+        True, True, mm_config=_MmConfig(enable_mm_embeds=True, limit_per_prompt={"image": 0})
+    )
+    assert not mm_salt.engine_accepts_mm_inputs(image_only)
+    _fake_vllm_registry(monkeypatch, lambda mc: True, supported=["image", "video"])
     for limits in ({"image": 0}, {"image": 0, "audio": 0}):
         limited = _ModelConfig(
             True, True, mm_config=_MmConfig(enable_mm_embeds=True, limit_per_prompt=limits)
         )
         assert mm_salt.engine_accepts_mm_inputs(limited), limits
+    # The supported set unknown (no registry answer): the tower is assumed.
+    _fake_vllm_registry(monkeypatch, lambda mc: True)
+    assert mm_salt.engine_accepts_mm_inputs(image_only)
 
 
 # --- the registry fallback (vLLM 0.19-0.20, no ModelConfig property) ---
@@ -177,6 +190,10 @@ def test_engine_accepts_mm_inputs_registry_without_processor(monkeypatch, caplog
     warnings = [r for r in caplog.records if "FooForConditionalGeneration" in r.getMessage()]
     assert len(warnings) == 1
     assert "no processor" in warnings[0].getMessage()
+    # --language-model-only is read off the config itself, before any probe:
+    # an unknown registry answer never puts such a worker on the vision side.
+    lmo = _ModelConfig(True, mm_config=_MmConfig(language_model_only=True))
+    assert not mm_salt.engine_accepts_mm_inputs(lmo)
 
 
 def test_engine_accepts_mm_inputs_registry_failure_keeps_architecture_answer(monkeypatch):

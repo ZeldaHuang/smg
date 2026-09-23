@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::OnceLock};
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -76,22 +77,31 @@ fn modality_limit_override(modality: Modality) -> Option<usize> {
     }
 }
 
-/// The image format a content part names: sniffed from inline bytes, read
-/// from a data URL's media type, or taken from the URL path's extension.
-/// `None` when nothing says (a URL without an extension, another modality).
+/// The image format a content part names: sniffed from the bytes (inline,
+/// or decoded from a data URL) before the client's media type is believed,
+/// else the media type in any case, else the URL path's extension. `None`
+/// when nothing says (a URL without an extension, another modality).
 fn image_format_of(part: &MediaContentPart) -> Option<image::ImageFormat> {
+    let from_media_type = |media_type: &str| {
+        image::ImageFormat::from_mime_type(media_type.trim().to_ascii_lowercase())
+    };
     match part {
         MediaContentPart::ImageData {
             data, mime_type, ..
-        } => image::guess_format(data).ok().or_else(|| {
-            mime_type
-                .as_deref()
-                .and_then(image::ImageFormat::from_mime_type)
-        }),
+        } => image::guess_format(data)
+            .ok()
+            .or_else(|| mime_type.as_deref().and_then(from_media_type)),
         MediaContentPart::ImageUrl { url, .. } => {
             if let Some(rest) = url.strip_prefix("data:") {
-                let media_type = rest.split([';', ',']).next().unwrap_or_default();
-                return image::ImageFormat::from_mime_type(media_type);
+                let (header, payload) = rest.split_once(',').unwrap_or((rest, ""));
+                let mut parameters = header.split(';');
+                let media_type = parameters.next().unwrap_or_default();
+                let sniffed = parameters
+                    .any(|parameter| parameter.trim().eq_ignore_ascii_case("base64"))
+                    .then(|| BASE64_STANDARD.decode(payload.trim()).ok())
+                    .flatten()
+                    .and_then(|bytes| image::guess_format(&bytes).ok());
+                return sniffed.or_else(|| from_media_type(media_type));
             }
             let path = url.split(['?', '#']).next().unwrap_or_default();
             let extension = path.rsplit('/').next()?.rsplit_once('.')?.1;
@@ -618,21 +628,28 @@ mod tests {
         assert!(NoBmp
             .validate_image_formats(std::slice::from_ref(&png))
             .is_ok());
-        // Sniffed from the bytes, from a data URL's type, or from the URL path.
+        // Sniffed from the bytes (inline, or decoded from a data URL, before
+        // the client's media type is believed), from a data URL's type in
+        // any case, or from the URL path.
+        let data_url = |url: &str| MediaContentPart::ImageUrl {
+            url: url.to_string(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        };
         let rejected = [
             bmp,
-            MediaContentPart::ImageUrl {
-                url: "data:image/bmp;base64,Qk0AAA==".to_string(),
-                detail: None,
+            MediaContentPart::ImageData {
+                data: b"zz".to_vec(),
+                mime_type: Some("IMAGE/BMP".to_string()),
                 uuid: None,
-                max_long_side_pixel: None,
-            },
-            MediaContentPart::ImageUrl {
-                url: "https://a/scan.BMP?x=1".to_string(),
                 detail: None,
-                uuid: None,
-                max_long_side_pixel: None,
             },
+            data_url("data:image/bmp;base64,Qk0AAA=="),
+            data_url("data:image/BMP;base64,Qk0AAA=="),
+            // BMP bytes behind a lying media type.
+            data_url("data:image/png;base64,Qk0AAAAA"),
+            data_url("https://a/scan.BMP?x=1"),
         ];
         for part in &rejected {
             assert_eq!(

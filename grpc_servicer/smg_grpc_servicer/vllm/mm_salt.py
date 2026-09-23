@@ -19,6 +19,11 @@ def engine_accepts_mm_inputs(model_config) -> bool:
     label, so it comes from vLLM's own check: the ``supports_multimodal_inputs``
     property where ``ModelConfig`` has it, the registry's method otherwise.
     """
+    mm_config = getattr(model_config, "multimodal_config", None)
+    # --language-model-only is a fact of the config, read before any probe
+    # whose answer might be unknown.
+    if mm_config is not None and getattr(mm_config, "language_model_only", False):
+        return False
     supports = getattr(model_config, "supports_multimodal_inputs", None)
     if supports is None:
         supports = _registry_supports_multimodal_inputs(model_config)
@@ -64,18 +69,33 @@ def _architecture_name(model_config) -> str:
 
 
 def _mm_embeds_only(model_config) -> bool:
-    """Whether the engine ingests only pre-computed embeddings (no encoder).
+    """Whether the engine ingests only pre-computed embeddings (no pixels).
 
-    True when ``enable_mm_embeds`` is on under ``--language-model-only``,
-    which drops the vision encoder. A zero limit for a modality is a limit
-    on that modality, not the absence of the tower, and the modalities the
-    config does not list keep their defaults, so limits alone never
-    conclude it.
+    True when ``enable_mm_embeds`` is on and every modality the model
+    supports has a limit of 0: an image-only model with ``image=0`` has no
+    use for its tower. The supported set comes from the registry; a limit
+    on one modality of a model that supports others is a limit, not the
+    absence of the tower, and an unknown supported set assumes the tower.
     """
     mm_config = getattr(model_config, "multimodal_config", None)
     if mm_config is None or not getattr(mm_config, "enable_mm_embeds", False):
         return False
-    return bool(getattr(mm_config, "language_model_only", False))
+    get_limit = getattr(mm_config, "get_limit_per_prompt", None)
+    supported = _supported_modalities(model_config)
+    if get_limit is None or not supported:
+        return False
+    return all(get_limit(modality) == 0 for modality in supported)
+
+
+def _supported_modalities(model_config) -> list[str]:
+    """The modalities the model's processor takes, per vLLM's registry;
+    empty when there is no registry to ask."""
+    try:
+        from vllm.multimodal import MULTIMODAL_REGISTRY
+
+        return list(MULTIMODAL_REGISTRY.get_supported_mm_limits(model_config))
+    except Exception:  # noqa: BLE001 - unknown means the tower is assumed
+        return []
 
 
 def has_preprocessed_mm_payload(mm_inputs) -> bool:
