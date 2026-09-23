@@ -8,7 +8,8 @@ use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     media::FrameSampling,
     types::{
-        EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId, VideoSamplingInfo,
+        EncoderFieldLayouts, FieldLayout, MediaContentPart, Modality, PromptReplacement, TokenId,
+        VideoSamplingInfo,
     },
     vision::PreProcessorConfig,
 };
@@ -42,6 +43,8 @@ pub enum ModelRegistryError {
         spec: &'static str,
         modality: Modality,
     },
+    #[error("{format} images are not accepted by model spec {spec}")]
+    UnsupportedImageFormat { spec: &'static str, format: String },
 }
 
 pub type RegistryResult<T> = Result<T, ModelRegistryError>;
@@ -70,6 +73,31 @@ fn modality_limit_override(modality: Modality) -> Option<usize> {
         Modality::Video => env_count_override(&VIDEO_MAX_COUNT_OVERRIDE, "SMG_VIDEO_MAX_COUNT"),
         Modality::Audio => env_count_override(&AUDIO_MAX_COUNT_OVERRIDE, "SMG_AUDIO_MAX_COUNT"),
         Modality::ImageEmbeds => None,
+    }
+}
+
+/// The image format a content part names: sniffed from inline bytes, read
+/// from a data URL's media type, or taken from the URL path's extension.
+/// `None` when nothing says (a URL without an extension, another modality).
+fn image_format_of(part: &MediaContentPart) -> Option<image::ImageFormat> {
+    match part {
+        MediaContentPart::ImageData {
+            data, mime_type, ..
+        } => image::guess_format(data).ok().or_else(|| {
+            mime_type
+                .as_deref()
+                .and_then(image::ImageFormat::from_mime_type)
+        }),
+        MediaContentPart::ImageUrl { url, .. } => {
+            if let Some(rest) = url.strip_prefix("data:") {
+                let media_type = rest.split([';', ',']).next().unwrap_or_default();
+                return image::ImageFormat::from_mime_type(media_type);
+            }
+            let path = url.split(['?', '#']).next().unwrap_or_default();
+            let extension = path.rsplit('/').next()?.rsplit_once('.')?.1;
+            image::ImageFormat::from_extension(extension)
+        }
+        _ => None,
     }
 }
 
@@ -253,6 +281,34 @@ pub trait ModelProcessorSpec: Send + Sync {
                 .copied()
                 .or_else(|| modality_limit_override(modality))
         })
+    }
+
+    /// Image formats the model's vendor refuses; the gateway refuses them
+    /// up front, judged from the bytes, the data URL's type or the URL path.
+    fn rejected_image_formats(&self) -> &'static [image::ImageFormat] {
+        &[]
+    }
+
+    /// Refuse an image part whose format is one of
+    /// [`Self::rejected_image_formats`].
+    fn validate_image_formats(&self, parts: &[MediaContentPart]) -> RegistryResult<()> {
+        let rejected = self.rejected_image_formats();
+        if rejected.is_empty() {
+            return Ok(());
+        }
+        for part in parts {
+            if let Some(format) = image_format_of(part).filter(|f| rejected.contains(f)) {
+                return Err(ModelRegistryError::UnsupportedImageFormat {
+                    spec: self.name(),
+                    format: format
+                        .extensions_str()
+                        .first()
+                        .map_or("unknown", |s| *s)
+                        .to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn processor_kwargs(&self, metadata: &ModelMetadata) -> RegistryResult<Value>;
@@ -504,6 +560,90 @@ mod tests {
     fn worker_expandable_defaults_to_false() {
         assert!(!TestSpec.worker_expandable(Modality::Image));
         assert!(!TestSpec.worker_expandable(Modality::Video));
+    }
+
+    #[test]
+    fn image_formats_are_accepted_unless_a_spec_rejects_them() {
+        assert!(TestSpec.rejected_image_formats().is_empty());
+        let bmp = MediaContentPart::ImageData {
+            data: b"BM\x00\x00".to_vec(),
+            mime_type: None,
+            uuid: None,
+            detail: None,
+        };
+        assert!(TestSpec
+            .validate_image_formats(std::slice::from_ref(&bmp))
+            .is_ok());
+
+        struct NoBmp;
+        impl ModelProcessorSpec for NoBmp {
+            fn name(&self) -> &'static str {
+                "no-bmp"
+            }
+            fn matches(&self, _metadata: &ModelMetadata) -> bool {
+                true
+            }
+            fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
+                Ok("<img>".to_string())
+            }
+            fn placeholder_token_id(&self, _metadata: &ModelMetadata) -> RegistryResult<TokenId> {
+                Ok(1)
+            }
+            fn modality_limits(
+                &self,
+                _metadata: &ModelMetadata,
+            ) -> RegistryResult<HashMap<Modality, usize>> {
+                Ok(HashMap::from([(Modality::Image, 1)]))
+            }
+            fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
+                Ok(Value::Null)
+            }
+            fn prompt_replacements(
+                &self,
+                _metadata: &ModelMetadata,
+                _preprocessed: &PreprocessedEncoderInputs,
+            ) -> RegistryResult<Vec<PromptReplacement>> {
+                Ok(Vec::new())
+            }
+            fn rejected_image_formats(&self) -> &'static [image::ImageFormat] {
+                &[image::ImageFormat::Bmp]
+            }
+        }
+        let png = MediaContentPart::ImageUrl {
+            url: "https://a/x.png".to_string(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        };
+        assert!(NoBmp
+            .validate_image_formats(std::slice::from_ref(&png))
+            .is_ok());
+        // Sniffed from the bytes, from a data URL's type, or from the URL path.
+        let rejected = [
+            bmp,
+            MediaContentPart::ImageUrl {
+                url: "data:image/bmp;base64,Qk0AAA==".to_string(),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            },
+            MediaContentPart::ImageUrl {
+                url: "https://a/scan.BMP?x=1".to_string(),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            },
+        ];
+        for part in &rejected {
+            assert_eq!(
+                NoBmp.validate_image_formats(std::slice::from_ref(part)),
+                Err(ModelRegistryError::UnsupportedImageFormat {
+                    spec: "no-bmp",
+                    format: "bmp".to_string(),
+                }),
+                "{part:?}"
+            );
+        }
     }
 
     #[test]
