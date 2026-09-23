@@ -5,22 +5,19 @@ from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 
+# Architectures whose registry probe failed, each warned about once.
+_warned_architectures: set[str] = set()
+
 
 def engine_accepts_mm_inputs(model_config) -> bool:
     """Whether the engine runs a vision encoder for pixel payloads.
 
-    ``is_multimodal_model`` only reports the architecture: it stays true
-    under ``--language-model-only``, which zeroes every modality limit and
-    drops the vision encoder (encoder-cache budget 0), and it is true for
-    ``enable_mm_embeds``-only models that ingest pre-computed embeddings but
-    cannot encode pixels. The router reads this through the worker's
-    ``supports_vision`` label to decide whether a decode leg may carry an mm
-    payload, so the answer must come from vLLM's own check. That check moved
-    between releases:
-
-    - vLLM main: ``ModelConfig.supports_multimodal_inputs`` property;
-    - vLLM 0.19-0.20 (the servicer's supported range): the equivalent
-      ``MULTIMODAL_REGISTRY.supports_multimodal_inputs(model_config)``.
+    ``is_multimodal_model`` reports the architecture only: it stays true
+    under ``--language-model-only``, which drops the encoder, and for an
+    ``enable_mm_embeds``-only engine, which ingests embeddings but encodes
+    no pixels. The router reads the answer as the worker's ``supports_vision``
+    label, so it comes from vLLM's own check: the ``supports_multimodal_inputs``
+    property where ``ModelConfig`` has it, the registry's method otherwise.
     """
     supports = getattr(model_config, "supports_multimodal_inputs", None)
     if supports is None:
@@ -44,38 +41,41 @@ def _registry_supports_multimodal_inputs(model_config) -> bool:
         return True
     try:
         return bool(MULTIMODAL_REGISTRY.supports_multimodal_inputs(model_config))
-    except ValueError:
-        # No registered processor for this architecture: text-only.
-        return False
-    except Exception:
-        # An unexpected probe failure keeps the previous
-        # architecture-based answer rather than disabling a healthy
-        # full-vision worker.
-        logger.warning(
-            "supports_multimodal_inputs probe failed; reporting the architecture's "
-            "multimodal capability",
-            exc_info=True,
-        )
+    except Exception as e:  # noqa: BLE001 - unknown means multimodal, the safe side
+        # A registry without an entry for the architecture (ValueError) or
+        # any other probe failure: the engine rejects what it truly cannot
+        # take, while a "no vision" answer would take a healthy full-vision
+        # worker out of service for every PD image request.
+        architecture = _architecture_name(model_config)
+        if architecture not in _warned_architectures:
+            _warned_architectures.add(architecture)
+            logger.warning(
+                "supports_multimodal_inputs probe failed for %s (%s); reporting the "
+                "architecture's multimodal capability",
+                architecture,
+                e,
+            )
         return True
+
+
+def _architecture_name(model_config) -> str:
+    architectures = getattr(model_config, "architectures", None) or []
+    return ",".join(architectures) or str(getattr(model_config, "architecture", "unknown"))
 
 
 def _mm_embeds_only(model_config) -> bool:
     """Whether the engine ingests only pre-computed embeddings (no encoder).
 
-    True when ``enable_mm_embeds`` is on and every explicitly listed modality
-    limit is 0 — including the ``--language-model-only`` case, where
-    ``get_limit_per_prompt`` reads 0 for every modality.
+    True when ``enable_mm_embeds`` is on under ``--language-model-only``,
+    which drops the vision encoder. A zero limit for a modality is a limit
+    on that modality, not the absence of the tower, and the modalities the
+    config does not list keep their defaults, so limits alone never
+    conclude it.
     """
     mm_config = getattr(model_config, "multimodal_config", None)
     if mm_config is None or not getattr(mm_config, "enable_mm_embeds", False):
         return False
-    limits = getattr(mm_config, "limit_per_prompt", None) or {}
-    get_limit = getattr(mm_config, "get_limit_per_prompt", None)
-    if get_limit is None:
-        return False
-    if getattr(mm_config, "language_model_only", False):
-        return True
-    return bool(limits) and all(get_limit(modality) == 0 for modality in limits)
+    return bool(getattr(mm_config, "language_model_only", False))
 
 
 def has_preprocessed_mm_payload(mm_inputs) -> bool:

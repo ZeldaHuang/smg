@@ -76,6 +76,7 @@ class _ModelConfig:
 
     def __init__(self, is_multimodal_model, supports_multimodal_inputs=None, mm_config=None):
         self.is_multimodal_model = is_multimodal_model
+        self.architectures = ["FooForConditionalGeneration"]
         self.multimodal_config = _MmConfig() if is_multimodal_model else None
         if mm_config is not None:
             self.multimodal_config = mm_config
@@ -114,20 +115,23 @@ def test_engine_accepts_mm_inputs_text_model():
 
 
 def test_engine_accepts_mm_inputs_mm_embeds_only():
-    # enable_mm_embeds with every modality limit at 0 ingests pre-computed
-    # embeddings but has no encoder for pixel payloads.
-    embeds_only = _ModelConfig(
-        True,
-        True,  # vLLM counts embeds-only engines as accepting mm inputs
-        mm_config=_MmConfig(enable_mm_embeds=True, limit_per_prompt={"image": 0}),
-    )
-    assert not mm_salt.engine_accepts_mm_inputs(embeds_only)
+    # enable_mm_embeds under --language-model-only ingests pre-computed
+    # embeddings but has no encoder for pixel payloads; vLLM counts it as
+    # accepting mm inputs.
     flagged = _ModelConfig(
         True,
         True,
         mm_config=_MmConfig(language_model_only=True, enable_mm_embeds=True),
     )
     assert not mm_salt.engine_accepts_mm_inputs(flagged)
+    # A zero limit is a limit on that modality, not the absence of the
+    # vision tower: the modalities the config does not list keep their
+    # defaults, so limits alone never conclude language-model-only.
+    for limits in ({"image": 0}, {"image": 0, "audio": 0}):
+        limited = _ModelConfig(
+            True, True, mm_config=_MmConfig(enable_mm_embeds=True, limit_per_prompt=limits)
+        )
+        assert mm_salt.engine_accepts_mm_inputs(limited), limits
 
 
 # --- the registry fallback (vLLM 0.19-0.20, no ModelConfig property) ---
@@ -156,14 +160,23 @@ def test_engine_accepts_mm_inputs_text_model_skips_the_probe(monkeypatch):
     assert not mm_salt.engine_accepts_mm_inputs(_ModelConfig(False))
 
 
-def test_engine_accepts_mm_inputs_registry_without_processor(monkeypatch):
-    # A multimodal architecture with no registered processor is text-only;
-    # the registry raises ValueError (main's own check treats it the same).
+def test_engine_accepts_mm_inputs_registry_without_processor(monkeypatch, caplog):
+    # A registry without a processor entry for the architecture (a vLLM
+    # nightly, say) raises ValueError. Unknown means multimodal, the safe
+    # side: the engine rejects what it truly cannot take, while a "no
+    # vision" answer would take a healthy decode worker out of service for
+    # every PD image request. One warning names the architecture.
     def probe(mc):
         raise ValueError("no processor")
 
     _fake_vllm_registry(monkeypatch, probe)
-    assert not mm_salt.engine_accepts_mm_inputs(_ModelConfig(True))
+    mm_salt._warned_architectures.clear()
+    with caplog.at_level("WARNING"):
+        assert mm_salt.engine_accepts_mm_inputs(_ModelConfig(True))
+        assert mm_salt.engine_accepts_mm_inputs(_ModelConfig(True))
+    warnings = [r for r in caplog.records if "FooForConditionalGeneration" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "no processor" in warnings[0].getMessage()
 
 
 def test_engine_accepts_mm_inputs_registry_failure_keeps_architecture_answer(monkeypatch):
