@@ -105,11 +105,10 @@ fn image_format_of(part: &MediaContentPart) -> Option<image::ImageFormat> {
                 let sniffed = parameters
                     .any(|parameter| parameter.trim().eq_ignore_ascii_case("base64"))
                     .then(|| {
-                        let payload = payload.trim();
-                        let end = payload
-                            .char_indices()
-                            .nth(SNIFF_BASE64_CHARS)
-                            .map_or(payload.len(), |(i, _)| i);
+                        // Bytes, not chars: base64 is ASCII, anything else
+                        // fails to decode, and a byte prefix cannot panic.
+                        let payload = payload.trim().as_bytes();
+                        let end = payload.len().min(SNIFF_BASE64_CHARS);
                         BASE64_STANDARD.decode(&payload[..end - end % 4]).ok()
                     })
                     .flatten()
@@ -676,6 +675,28 @@ mod tests {
                     format: "bmp".to_string(),
                 }),
                 "{part:?}"
+            );
+        }
+        // Client-supplied payloads that are not base64 at all, multi-byte
+        // characters included, are sniffed without panicking and fall back
+        // to the media type.
+        for url in [
+            "data:image/png;base64,aéé",
+            "data:image/bmp;base64,ééé",
+            "data:image/bmp;base64,",
+        ] {
+            let expected = url.starts_with("data:image/bmp").then(|| {
+                ModelRegistryError::UnsupportedImageFormat {
+                    spec: "no-bmp",
+                    format: "bmp".to_string(),
+                }
+            });
+            assert_eq!(
+                NoBmp
+                    .validate_image_formats(std::slice::from_ref(&data_url(url)))
+                    .err(),
+                expected,
+                "{url}"
             );
         }
     }
