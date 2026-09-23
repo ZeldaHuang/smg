@@ -94,6 +94,31 @@ sglang:num_running_reqs{model_name="org/model:v1",worker_addr="http://10.0.0.2:8
 }
 
 #[test]
+fn test_colons_in_label_names_are_sanitized_not_restored() {
+    // A colon is legal in a metric name and in a label value, never in a
+    // label name: restoring one there would make the whole page unscrapeable,
+    // so a label name keeps the `_` the old sanitizer gave it.
+    let pack = MetricPack {
+        labels: vec![(
+            "worker_addr".to_string(),
+            "http://10.0.0.1:8000".to_string(),
+        )],
+        metrics_text: r#"
+# HELP vllm:num_requests_running Running: now.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model:name="org/model:v1"} 3
+"#
+        .to_string(),
+    };
+    let result = aggregate_metrics(vec![pack]).unwrap();
+    let expected = r#"# HELP vllm:num_requests_running Running: now.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="org/model:v1",worker_addr="http://10.0.0.1:8000"} 3
+"#;
+    assert_eq!(result.trim(), expected.trim());
+}
+
+#[test]
 fn test_colon_and_underscore_twins_stay_distinct() {
     // `a:b` and `a_b` are different Prometheus metrics; replacing colons with
     // underscores merged them into one family. Leading and doubled colons are

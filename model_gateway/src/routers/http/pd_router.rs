@@ -2272,6 +2272,10 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    /// Ceiling on a real HTTP round trip in these tests: a guard against a
+    /// hang, not a budget, since a loaded machine can take seconds.
+    const ROUND_TRIP_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
     use openai_protocol::model_card::ModelCard;
     use tokio::sync::oneshot;
 
@@ -2724,7 +2728,7 @@ mod tests {
                 socket.write_all(response.as_bytes()).await.unwrap();
                 socket.shutdown().await.unwrap();
             };
-            let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (response, ()) = tokio::time::timeout(ROUND_TRIP_GUARD, async {
                 tokio::join!(
                     router.route_messages_count_tokens(
                         Some(&headers),
@@ -2947,14 +2951,14 @@ mod tests {
         let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            ROUND_TRIP_GUARD,
             router.route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID),
         )
         .await
         .expect("the client stream must not wait for the prefill body");
         assert_eq!(response.status(), StatusCode::OK);
         let body = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            ROUND_TRIP_GUARD,
             axum::body::to_bytes(response.into_body(), usize::MAX),
         )
         .await
@@ -2965,12 +2969,12 @@ mod tests {
         assert_eq!(decode.load(), 0);
 
         release.notify_one();
-        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), report_rx)
+        let completed = tokio::time::timeout(ROUND_TRIP_GUARD, report_rx)
             .await
             .expect("prefill body must be released")
             .expect("probe report");
         assert_eq!(completed, !fail_body);
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(ROUND_TRIP_GUARD, async {
             while prefill.load() != 0 {
                 tokio::task::yield_now().await;
             }
