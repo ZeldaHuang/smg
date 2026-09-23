@@ -88,12 +88,18 @@ def _mm_embeds_only(model_config) -> bool:
 
 
 def _supported_modalities(model_config) -> list[str]:
-    """The modalities the model's processor takes, per vLLM's registry;
-    empty when there is no registry to ask."""
+    """The modalities the model's processor takes, from its processing info
+    (``get_processing_info`` on vLLM main, ``_create_processing_info`` on
+    0.19-0.20); empty when there is no registry to ask."""
     try:
         from vllm.multimodal import MULTIMODAL_REGISTRY
 
-        return list(MULTIMODAL_REGISTRY.get_supported_mm_limits(model_config))
+        processing_info = getattr(MULTIMODAL_REGISTRY, "get_processing_info", None) or getattr(
+            MULTIMODAL_REGISTRY, "_create_processing_info", None
+        )
+        if processing_info is None:
+            return []
+        return list(processing_info(model_config).get_supported_mm_limits())
     except Exception:  # noqa: BLE001 - unknown means the tower is assumed
         return []
 

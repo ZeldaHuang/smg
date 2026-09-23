@@ -670,8 +670,9 @@ impl WorkerSelectionStage {
         // can pair (`sequential_pd_decode_form` would refuse the leg with a
         // non-retryable 400 after selection); with none the pool is used as
         // it is, and dispatch names the incompatibility. "Can pair" reads
-        // the index: an open prefill with an open vision-capable partner on
-        // its runtime, both on the retained wire when one is pinned.
+        // the index, for both legs since the filter applies to both: an open
+        // vision-capable prefill with an open vision-capable partner on its
+        // runtime, both on the retained wire when one is pinned.
         let open = |w: &Arc<dyn Worker>| {
             w.is_available()
                 && wire.is_none_or(|wire| {
@@ -684,7 +685,7 @@ impl WorkerSelectionStage {
                 .prefill
                 .iter()
                 .zip(&pairs.partners)
-                .filter(|(prefill, _)| open(prefill))
+                .filter(|(prefill, _)| open(prefill) && vision_capable(prefill.as_ref()))
                 .any(|(prefill, partners)| {
                     partners.iter().any(|decode| {
                         open(decode)
@@ -1194,6 +1195,26 @@ mod tests {
             .select_pd_pair(model_id, None, None, None, None, None, None, false, true)
             .expect("the language-model-only decode worker still pairs");
         assert_eq!(decode.url(), "grpc://127.0.0.1:8310");
+
+        // The filter applies to both legs: a vision decode worker whose only
+        // partner prefill is itself language-model-only cannot pair either.
+        register(
+            "grpc://127.0.0.1:8301",
+            WorkerType::Prefill,
+            RuntimeType::Sglang,
+            true,
+        );
+        let (prefill, decode, _) = stage
+            .select_pd_pair(model_id, None, None, None, None, None, None, false, true)
+            .expect("a pair from the pool as it is");
+        assert!(
+            (prefill.url(), decode.url()) == ("grpc://127.0.0.1:8300", "grpc://127.0.0.1:8310")
+                || (prefill.url(), decode.url())
+                    == ("grpc://127.0.0.1:8301", "grpc://127.0.0.1:8311"),
+            "{} / {}",
+            prefill.url(),
+            decode.url()
+        );
     }
 
     /// A saturated prefill leg is a pressure condition, not model absence.

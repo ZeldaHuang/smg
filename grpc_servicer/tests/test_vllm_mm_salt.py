@@ -84,9 +84,11 @@ class _ModelConfig:
             self.supports_multimodal_inputs = supports_multimodal_inputs
 
 
-def _fake_vllm_registry(monkeypatch, probe, supported=None):
+def _fake_vllm_registry(monkeypatch, probe, supported=None, info_method="get_processing_info"):
     """Install a fake ``vllm.multimodal`` whose registry probe is ``probe``
-    and whose supported modalities are ``supported`` (unknown when None)."""
+    and whose processing info (reached through ``info_method``: the public
+    accessor on vLLM main, the private one on 0.19-0.20) lists ``supported``
+    modalities (unknown when None)."""
     import sys
     import types
 
@@ -94,7 +96,8 @@ def _fake_vllm_registry(monkeypatch, probe, supported=None):
     mm_mod = types.ModuleType("vllm.multimodal")
     registry = types.SimpleNamespace(supports_multimodal_inputs=probe)
     if supported is not None:
-        registry.get_supported_mm_limits = lambda mc: dict.fromkeys(supported)
+        info = types.SimpleNamespace(get_supported_mm_limits=lambda: dict.fromkeys(supported))
+        setattr(registry, info_method, lambda mc, tokenizer=None: info)
     mm_mod.MULTIMODAL_REGISTRY = registry
     vllm_mod.multimodal = mm_mod
     monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
@@ -142,6 +145,11 @@ def test_engine_accepts_mm_inputs_mm_embeds_only(monkeypatch):
             True, True, mm_config=_MmConfig(enable_mm_embeds=True, limit_per_prompt=limits)
         )
         assert mm_salt.engine_accepts_mm_inputs(limited), limits
+    # vLLM 0.19-0.20 reach the same info through the private constructor.
+    _fake_vllm_registry(
+        monkeypatch, lambda mc: True, supported=["image"], info_method="_create_processing_info"
+    )
+    assert not mm_salt.engine_accepts_mm_inputs(image_only)
     # The supported set unknown (no registry answer): the tower is assumed.
     _fake_vllm_registry(monkeypatch, lambda mc: True)
     assert mm_salt.engine_accepts_mm_inputs(image_only)

@@ -77,6 +77,10 @@ fn modality_limit_override(modality: Modality) -> Option<usize> {
     }
 }
 
+/// Base64 characters decoded to sniff a data URL's format: 96 bytes, past
+/// every magic signature `image::guess_format` reads.
+const SNIFF_BASE64_CHARS: usize = 128;
+
 /// The image format a content part names: sniffed from the bytes (inline,
 /// or decoded from a data URL) before the client's media type is believed,
 /// else the media type in any case, else the URL path's extension. `None`
@@ -96,9 +100,18 @@ fn image_format_of(part: &MediaContentPart) -> Option<image::ImageFormat> {
                 let (header, payload) = rest.split_once(',').unwrap_or((rest, ""));
                 let mut parameters = header.split(';');
                 let media_type = parameters.next().unwrap_or_default();
+                // The magic bytes sit in the first few dozen bytes: decode a
+                // bounded prefix (whole base64 quads), not a copy of the image.
                 let sniffed = parameters
                     .any(|parameter| parameter.trim().eq_ignore_ascii_case("base64"))
-                    .then(|| BASE64_STANDARD.decode(payload.trim()).ok())
+                    .then(|| {
+                        let payload = payload.trim();
+                        let end = payload
+                            .char_indices()
+                            .nth(SNIFF_BASE64_CHARS)
+                            .map_or(payload.len(), |(i, _)| i);
+                        BASE64_STANDARD.decode(&payload[..end - end % 4]).ok()
+                    })
                     .flatten()
                     .and_then(|bytes| image::guess_format(&bytes).ok());
                 return sniffed.or_else(|| from_media_type(media_type));
@@ -647,8 +660,12 @@ mod tests {
             },
             data_url("data:image/bmp;base64,Qk0AAA=="),
             data_url("data:image/BMP;base64,Qk0AAA=="),
-            // BMP bytes behind a lying media type.
+            // BMP bytes behind a lying media type, short and past the sniffed prefix.
             data_url("data:image/png;base64,Qk0AAAAA"),
+            data_url(&format!(
+                "data:image/png;base64,{}",
+                BASE64_STANDARD.encode([b"BM".as_slice(), &[0u8; 4096]].concat())
+            )),
             data_url("https://a/scan.BMP?x=1"),
         ];
         for part in &rejected {
