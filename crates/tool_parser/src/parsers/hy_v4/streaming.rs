@@ -38,6 +38,8 @@ pub(super) struct StreamParser {
     announced: bool,
     group_has_calls: bool,
     failed: bool,
+    /// Byte offset already searched for the current buffered end marker.
+    scan_from: usize,
 }
 
 impl StreamParser {
@@ -62,6 +64,7 @@ impl StreamParser {
 
     fn consume(&mut self, n: usize) {
         self.buffer.drain(..n);
+        self.scan_from = 0;
     }
     fn whitespace(&mut self) {
         let n = self.buffer.len() - self.buffer.trim_start().len();
@@ -156,11 +159,25 @@ impl StreamParser {
                         if key.starts_with(rest) || end.starts_with(rest) {
                             break;
                         }
-                        return self.invalid("expected argument or call end after tool name");
+                        if self.group_has_calls {
+                            return self.invalid("expected argument or call end after tool name");
+                        }
+                        out.normal_text
+                            .push_str(&std::mem::take(&mut self.prospective));
+                        self.state = State::Text;
+                        self.scan_from = 0;
+                        continue;
                     }
                     let name = self.buffer[..i].trim();
                     if name.is_empty() || name.contains('>') {
-                        return self.invalid("empty tool name");
+                        if self.group_has_calls {
+                            return self.invalid("empty tool name");
+                        }
+                        out.normal_text
+                            .push_str(&std::mem::take(&mut self.prospective));
+                        self.state = State::Text;
+                        self.scan_from = 0;
+                        continue;
                     }
                     self.name = name.to_owned();
                     self.consume(i);
@@ -192,7 +209,9 @@ impl StreamParser {
                 }
                 State::Key => {
                     let end = self.tag("/arg_key");
-                    let Some(i) = self.buffer.find(&end) else {
+                    let from = self.scan_from.min(self.buffer.len());
+                    let Some(i) = self.buffer[from..].find(&end).map(|i| from + i) else {
+                        self.scan_from = resume_offset(&self.buffer, end.len());
                         break;
                     };
                     self.key = self.buffer[..i].trim().to_owned();
@@ -234,7 +253,8 @@ impl StreamParser {
                 }
                 State::Value => {
                     let end = self.tag("/arg_value");
-                    if let Some(i) = self.buffer.find(&end) {
+                    let from = self.scan_from.min(self.buffer.len());
+                    if let Some(i) = self.buffer[from..].find(&end).map(|i| from + i) {
                         let value = if self.string_value {
                             format!("{}\"", escape(&self.buffer[..i])?)
                         } else {
@@ -248,6 +268,8 @@ impl StreamParser {
                             let n = self.buffer.len() - partial_suffix(&self.buffer, &end);
                             self.emit(&mut out, None, escape(&self.buffer[..n])?);
                             self.consume(n);
+                        } else {
+                            self.scan_from = resume_offset(&self.buffer, end.len());
                         }
                         break;
                     }
@@ -274,6 +296,14 @@ impl StreamParser {
         text.push_str(&std::mem::take(&mut self.buffer));
         text
     }
+}
+
+fn resume_offset(text: &str, marker_len: usize) -> usize {
+    let mut offset = text.len().saturating_sub(marker_len.saturating_sub(1));
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
 
 fn partial_suffix(text: &str, marker: &str) -> usize {

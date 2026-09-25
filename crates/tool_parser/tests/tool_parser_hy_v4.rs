@@ -107,6 +107,73 @@ async fn hy4_malformed_is_not_a_partial_call_and_buffer_is_bounded() {
         .is_err());
 }
 
+#[tokio::test]
+async fn hy4_unannounced_malformed_calls_fall_back_to_text() {
+    for text in [
+        "<tool_calls><tool_call>run<parameter>x</parameter></tool_call></tool_calls>tail",
+        "<tool_calls><tool_call></tool_call></tool_calls>",
+    ] {
+        let (expected, calls) = HyV4Parser::new().parse_complete(text).await.unwrap();
+        assert!(calls.is_empty());
+        assert_eq!(expected, text);
+
+        let mut parser = HyV4Parser::new();
+        let mut content = String::new();
+        for ch in text.chars() {
+            let result = parser
+                .parse_incremental(&ch.to_string(), &[])
+                .await
+                .unwrap();
+            assert!(result.calls.is_empty());
+            content.push_str(&result.normal_text);
+        }
+        content.push_str(&parser.take_unstreamed_normal_text());
+        assert_eq!(content, expected);
+    }
+}
+
+#[tokio::test]
+async fn hy4_typed_value_end_marker_can_be_split_after_cached_scan() {
+    let schemas: Vec<Tool> = vec![serde_json::from_value(json!({
+        "type": "function",
+        "function": {
+            "name": "run",
+            "parameters": {
+                "properties": {"items": {"type": "array"}}
+            }
+        }
+    }))
+    .unwrap()];
+    let mut parser = HyV4Parser::new();
+    let first = parser
+        .parse_incremental("<tool_calls><tool_call>run<arg_key>it", &schemas)
+        .await
+        .unwrap();
+    assert_eq!(first.calls[0].parameters, "{");
+    assert!(parser
+        .parse_incremental("ems</arg_k", &schemas)
+        .await
+        .unwrap()
+        .calls
+        .is_empty());
+    let value = parser
+        .parse_incremental("ey><arg_value>[1,2]", &schemas)
+        .await
+        .unwrap();
+    assert_eq!(value.calls[0].parameters, "\"items\":");
+    assert!(parser
+        .parse_incremental("</arg_val", &schemas)
+        .await
+        .unwrap()
+        .calls
+        .is_empty());
+    let last = parser
+        .parse_incremental("ue></tool_call></tool_calls>", &schemas)
+        .await
+        .unwrap();
+    assert_eq!(last.calls[0].parameters, "[1,2]}");
+}
+
 fn join_calls(
     deltas: Vec<tool_parser::types::ToolCallItem>,
 ) -> Vec<tool_parser::types::ToolCallItem> {

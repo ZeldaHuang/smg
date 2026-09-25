@@ -17,6 +17,7 @@ Parser library for extracting tool/function calls from LLM model outputs. Suppor
 | `Step3Parser` | Step-3 | `<steptml:function_call>...</steptml:function_call>` |
 | `KimiK2Parser` | Kimi K2 | `<\|tool_call_begin\|>...<\|tool_call_end\|>` |
 | `MinimaxM2Parser` | MiniMax M2 | `<FUNCTION_CALL>{...}</FUNCTION_CALL>` |
+| `HyV4Parser` | Hunyuan v4 (Hy4) | `<tool_calls[:suffix]><tool_call[:suffix]>...<arg_key[:suffix]>...<arg_value[:suffix]>...` |
 | `JsonParser` | OpenAI, Claude, Gemini | Direct JSON tool calls |
 
 ## Usage
@@ -157,31 +158,3 @@ pub struct StreamingParseResult {
 ## License
 
 Apache-2.0
-
-### Hy4 (`hy_v4`)
-
-Use `--tool-call-parser hy_v4` for Hunyuan v4 tagged calls. The parser learns
-checkpoint suffixes such as `:6124c78e` from `<tool_calls:6124c78e>` and handles
-`tool_call`, `arg_key` and `arg_value` delimiters across streaming boundaries.
-Tool schemas preserve literal strings and select JSON scalar/container types,
-including `anyOf`, `oneOf` and type arrays. Missing schemas default to strings.
-Tool names are emitted once the name boundary is known. Pure-string values
-stream as append-only JSON-escaped fragments; ambiguous unions and non-string
-values wait only for their own value-end marker. Split delimiter prefixes are
-held back, so markup is never emitted into a string. Each call keeps one index
-and receives its closing brace only when the model closes the call.
-
-Unannounced, truncated prospective calls are flushed as text. Announced but
-truncated calls stay incomplete (no fabricated JSON closures and no framing
-leaked as content). Malformed streaming markup returns an error and requires
-reset; already emitted fragments cannot be retracted. Non-streaming malformed
-calls retain the raw-text fallback. Buffered input is capped at 4 MiB; emitted
-string content is discarded from the buffer as it streams.
-
-This registers an output parser, not a Hy4 structural-tag grammar. Required
-and named tool choices retain SMG's generic JSON-schema constraint path; this
-change does not claim model-level equivalence of constrained generation with
-vLLM's Hy4 grammar. Validate those modes with the serving engine before use.
-
-Format reference: the `hy_v4_tool_parser.py` implementation in vLLM and
-[tencent/Hy4-preview-FP8's pinned chat template](https://huggingface.co/tencent/Hy4-preview-FP8/blob/4215ec29de873a998e849cee902654490c7ff4d1/chat_template.jinja).
